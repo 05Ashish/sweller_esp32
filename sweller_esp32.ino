@@ -311,7 +311,7 @@ void recordAudio(String teacherName) {
     for (int i = 0; i < samples_read; i++) {
       // Right shift by 14 bits to convert 32-bit to 16-bit
       // This preserves the 18-bit audio data in the 16-bit output
-      output_buff[i] = (i2s_buff[i] >> 16);
+      output_buff[i] = (i2s_buff[i] >> 14);
     }
     
     // 3. Write 16-bit data to SD card
