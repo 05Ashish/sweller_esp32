@@ -31,7 +31,7 @@
 
 // --- CONFIG ---
 #define SAMPLE_RATE 16000
-#define SD_SPI_FREQ 400000
+#define SD_SPI_FREQ 10000000
 #define MAX_RECORD_TIME_MS 1800000 // 30 Minutes
 #define SCREEN_DIM_LEVEL 1         // Lowest brightness (1-255)
 #define SCREEN_BRIGHT_LEVEL 255    // Full brightness
@@ -77,7 +77,7 @@ void initI2S() {
     // Standard I2S format for INMP441
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
+    .dma_buf_count = 12,
     // Buffer size in samples - INMP441 works well with 1024
     .dma_buf_len = 1024,
     .use_apll = false,
@@ -225,7 +225,7 @@ void recordAudio(String teacherName) {
   u8g2.sendBuffer();
 
   // Buffer sizes for INMP441 32-bit processing
-  const int samples_to_read = 2048;  // Number of samples per read
+  const int samples_to_read = 4096;  // Number of samples per read
   const int i2s_buffer_size = samples_to_read * 4;  // 4 bytes per 32-bit sample
   const int output_buffer_size = samples_to_read * 2;  // 2 bytes per 16-bit output
   
