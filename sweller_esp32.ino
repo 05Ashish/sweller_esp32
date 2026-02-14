@@ -1,596 +1,405 @@
+// ========================= ESP32 CODE (Arduino IDE) =========================
+// ESP32 Classroom Audio Recorder + Auto Uploader (RAW)
+// - No buttons, no OLED
+// - On power: record fixed duration -> upload to laptop
+// - Upload method: RAW HTTP body (most reliable)
+// - After success: rename to .sent.wav
+
 #include <Arduino.h>
-#include <U8g2lib.h>
-#include <Wire.h>
 #include <driver/i2s.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
 
-// --- PIN DEFINITIONS ---
-// Buttons (Active Low)
-#define BTN_UP 33
-#define BTN_DOWN 27
-#define BTN_SEL 13
+// ------------------- YOUR DETAILS -------------------
+#define DEVICE_ID        "CLASSROOM_01"
+#define WIFI_SSID        "Airtel_NEGI"
+#define WIFI_PASS        "mnian281996"
 
-// Mic (I2S INMP441)
-#define I2S_WS 25
-#define I2S_SCK 26
-#define I2S_SD 32
+#define PI_HOST          "192.168.1.7"
+#define PI_PORT          8000
+
+// ------------------- RECORDING SETTINGS -------------------
+#define SAMPLE_RATE           16000
+
+// 3 minutes (testing)
+#define RECORD_TIME_MS        180000UL
+
+// 30 minutes (final) -> use this instead when ready
+// #define RECORD_TIME_MS     1800000UL
+
+// ------------------- SD SETTINGS -------------------
+#define SD_SPI_FREQ           10000000
+
+// ------------------- PINS (ESP32 WROVER typical) -------------------
+// INMP441 I2S
+#define I2S_WS   25
+#define I2S_SCK  26
+#define I2S_SD   32
 #define I2S_PORT I2S_NUM_0
 
-// SD Card (SPI) - Pins for Wrover (CS=5)
-#define SD_CS 5
-#define SD_SCK 18
-#define SD_MISO 19
-#define SD_MOSI 23
+// SD Card SPI
+#define SD_CS    5
+#define SD_SCK   18
+#define SD_MISO  19
+#define SD_MOSI  23
 
-// OLED (I2C)
-#define OLED_RST 4
-#define OLED_SDA 21
-#define OLED_SCL 22
+SPIClass sdSPI(VSPI);
 
-// --- CONFIG ---
-#define SAMPLE_RATE 16000
-#define SD_SPI_FREQ 10000000
-#define MAX_RECORD_TIME_MS 1800000 // 30 Minutes
-#define SCREEN_DIM_LEVEL 1         // Lowest brightness (1-255)
-#define SCREEN_BRIGHT_LEVEL 255    // Full brightness
+// =========================================================
+// WAV HEADER (44 bytes) - safe, no struct padding issues
+// =========================================================
+void writeWavHeader44(File &file, uint32_t sampleRate, uint32_t dataSize) {
+  uint32_t chunkSize = 36 + dataSize;
+  uint32_t byteRate  = sampleRate * 1 * 16 / 8;
+  uint16_t blockAlign = 1 * 16 / 8;
 
-const char* TEACHER_NAMES[10] = {
-  "Priya Sharma", "Rajesh Kumar", "Anita Patel", "Vikram Singh",
-  "Meera Reddy", "Amit Gupta", "Kavita Rao", "Sanjay Mehta",
-  "Deepa Nair", "Arjun Verma"
+  uint8_t h[44];
+
+  // RIFF
+  h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F';
+  h[4] = (chunkSize) & 0xFF;
+  h[5] = (chunkSize >> 8) & 0xFF;
+  h[6] = (chunkSize >> 16) & 0xFF;
+  h[7] = (chunkSize >> 24) & 0xFF;
+
+  // WAVE
+  h[8]  = 'W'; h[9]  = 'A'; h[10] = 'V'; h[11] = 'E';
+
+  // fmt
+  h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
+  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;   // PCM fmt chunk size
+  h[20] = 1;  h[21] = 0;                          // AudioFormat = 1 (PCM)
+  h[22] = 1;  h[23] = 0;                          // NumChannels = 1
+
+  // SampleRate
+  h[24] = (sampleRate) & 0xFF;
+  h[25] = (sampleRate >> 8) & 0xFF;
+  h[26] = (sampleRate >> 16) & 0xFF;
+  h[27] = (sampleRate >> 24) & 0xFF;
+
+  // ByteRate
+  h[28] = (byteRate) & 0xFF;
+  h[29] = (byteRate >> 8) & 0xFF;
+  h[30] = (byteRate >> 16) & 0xFF;
+  h[31] = (byteRate >> 24) & 0xFF;
+
+  // BlockAlign
+  h[32] = (blockAlign) & 0xFF;
+  h[33] = (blockAlign >> 8) & 0xFF;
+
+  // BitsPerSample
+  h[34] = 16; h[35] = 0;
+
+  // data
+  h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a';
+  h[40] = (dataSize) & 0xFF;
+  h[41] = (dataSize >> 8) & 0xFF;
+  h[42] = (dataSize >> 16) & 0xFF;
+  h[43] = (dataSize >> 24) & 0xFF;
+
+  file.seek(0);
+  file.write(h, 44);
+}
+
+// =========================================================
+// I2S CONFIG (INMP441)
+// =========================================================
+i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+  .sample_rate = SAMPLE_RATE,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_I2S,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 8,
+  .dma_buf_len = 256,
+  .use_apll = false,
+  .tx_desc_auto_clear = false,
+  .fixed_mclk = 0
 };
 
-// --- GLOBALS ---
-U8G2_SSD1309_128X64_NONAME0_F_HW_I2C u8g2(U8G2_R0, OLED_RST);
-int currentSelection = 0;
+i2s_pin_config_t pin_config = {
+  .bck_io_num = I2S_SCK,
+  .ws_io_num = I2S_WS,
+  .data_out_num = -1,
+  .data_in_num = I2S_SD
+};
 
-enum MenuState { MENU_TEACHER_LIST, MENU_TEACHER_SELECTED, MENU_RECORDING };
-MenuState currentMenu = MENU_TEACHER_LIST;
-int selectedTeacher = 0;
-
-typedef struct __attribute__((packed)) {
-  char riff[4];
-  uint32_t flength;
-  char wave[4];
-  char fmt[4];
-  uint32_t chunk_size;
-  uint16_t format_tag;
-  uint16_t num_chans;
-  uint32_t srate;
-  uint32_t bytes_per_sec;
-  uint16_t bytes_per_samp;
-  uint16_t bits_per_samp;
-  char data[4];
-  uint32_t dlength;
-} wav_header_t;
-
-
-void initI2S() {
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    // INMP441 outputs 32-bit data (18-bit actual, left-justified in 32-bit)
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    // Standard I2S format for INMP441
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 12,
-    // Buffer size in samples - INMP441 works well with 1024
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-  };
-  
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK,      // Serial Clock (SCK) - GPIO 26
-    .ws_io_num = I2S_WS,        // Word Select (WS/LRCK) - GPIO 25
-    .data_out_num = I2S_PIN_NO_CHANGE,  // Not used for input
-    .data_in_num = I2S_SD       // Serial Data (SD) - GPIO 32
-  };
-  
-  // Install I2S driver
-  esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: I2S driver install failed: %d\n", err);
-  } else {
-    Serial.println("I2S driver installed successfully");
-  }
-  
-  err = i2s_set_pin(I2S_PORT, &pin_config);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: I2S set pin failed: %d\n", err);
-  } else {
-    Serial.println("I2S pins configured successfully");
-  }
-  
-  // Set sample rate explicitly
-  err = i2s_set_sample_rates(I2S_PORT, SAMPLE_RATE);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: I2S set sample rate failed: %d\n", err);
-  }
-  
-  Serial.println("\nINMP441 I2S Configuration:");
-  Serial.println("- Sample Rate: 16000 Hz");
-  Serial.println("- Bits per Sample: 32-bit (input)");
-  Serial.println("- Output Format: 16-bit WAV");
-  Serial.println("- Channel: Mono (Left)");
+// =========================================================
+// HELPERS
+// =========================================================
+void wifiOff() {
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
 }
 
-void updateWavHeader(File &file) {
-  if (!file) {
-    Serial.println("ERROR: Cannot update WAV header - invalid file");
-    return;
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.printf("WiFi connecting to: %s\n", WIFI_SSID);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(250);
+    Serial.print(".");
   }
-  file.flush();
-  uint32_t fileSize = file.size();
-  
-  if (fileSize < 44) {
-    Serial.println("ERROR: File too small for WAV header");
-    return;
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK, IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
   }
-  
-  wav_header_t header;
-  
-  memcpy(header.riff, "RIFF", 4); 
-  header.flength = fileSize - 8;
-  memcpy(header.wave, "WAVE", 4); 
-  memcpy(header.fmt, "fmt ", 4);
-  header.chunk_size = 16; 
-  header.format_tag = 1;  // PCM
-  header.num_chans = 1;   // Mono
-  header.srate = SAMPLE_RATE; 
-  header.bits_per_samp = 16;  // Output 16-bit WAV
-  header.bytes_per_sec = header.srate * header.num_chans * (header.bits_per_samp / 8);
-  header.bytes_per_samp = header.num_chans * (header.bits_per_samp / 8);
-  memcpy(header.data, "data", 4); 
-  header.dlength = fileSize - 44;
-  
-  file.seek(0); 
-  size_t written = file.write((uint8_t*)&header, sizeof(header));
-  
-  if (written != sizeof(header)) {
-    Serial.printf("ERROR: WAV header write incomplete: %d/%d bytes\n", written, sizeof(header));
-  } else {
-    Serial.println("WAV header updated successfully");
-  }
+
+  Serial.println("WiFi FAILED");
+  return false;
 }
 
-String getNextFilename(String folderPath) {
-  int id = 1;
-  while (true) {
-    String filename = folderPath + "/" + String(id) + ".wav";
-    if (!SD.exists(filename)) return filename;
-    id++;
-    if (id > 9999) {
-      Serial.println("WARNING: Max file count reached, using overflow.wav");
-      return folderPath + "/overflow.wav";
+String getNextFilename() {
+  // /rec/CLASSROOM_01_0001.wav
+  const char* folder = "/rec";
+  if (!SD.exists(folder)) SD.mkdir(folder);
+
+  for (int i = 1; i < 10000; i++) {
+    char name[64];
+    snprintf(name, sizeof(name), "/rec/%s_%04d.wav", DEVICE_ID, i);
+
+    String sentName = String(name);
+    sentName.replace(".wav", ".sent.wav");
+
+    if (!SD.exists(name) && !SD.exists(sentName)) {
+      return String(name);
     }
   }
+  return "/rec/FAIL.wav";
 }
 
-void recordAudio(String teacherName) {
-  Serial.println("\n========== RECORDING STARTED ==========");
-  
-  // 1. GO DIM (Start of Recording)
-  u8g2.setContrast(SCREEN_DIM_LEVEL); 
-  
-  String folderPath = "/" + teacherName;
-  folderPath.replace(" ", "_");
-  
-  if (!SD.exists(folderPath)) {
-    if (!SD.mkdir(folderPath)) {
-      Serial.printf("ERROR: Failed to create folder: %s\n", folderPath.c_str());
-      u8g2.setContrast(SCREEN_BRIGHT_LEVEL);
-      u8g2.clearBuffer(); 
-      u8g2.drawStr(10, 30, "Folder Error!"); 
-      u8g2.sendBuffer();
-      delay(2000); 
-      return;
-    }
-    Serial.printf("Created folder: %s\n", folderPath.c_str());
+bool markAsSent(const String &path) {
+  String sentPath = path;
+  sentPath.replace(".wav", ".sent.wav");
+
+  if (SD.rename(path, sentPath)) {
+    Serial.printf("Marked sent: %s\n", sentPath.c_str());
+    return true;
   }
-  
-  String filename = getNextFilename(folderPath);
-  Serial.printf("Opening file: %s\n", filename.c_str());
-  
+
+  Serial.println("Mark sent failed");
+  return false;
+}
+
+// =========================================================
+// RECORDING
+// =========================================================
+String recordFixedWav() {
+  String filename = getNextFilename();
+  Serial.printf("\nRecording -> %s\n", filename.c_str());
+
+  // Ensure it doesn't exist (safety)
+  if (SD.exists(filename)) SD.remove(filename);
+
   File file = SD.open(filename, FILE_WRITE);
-  
-  if(!file) {
-    Serial.println("ERROR: Failed to open file for writing");
-    u8g2.setContrast(SCREEN_BRIGHT_LEVEL);
-    u8g2.clearBuffer(); 
-    u8g2.drawStr(10, 30, "Write Error!"); 
-    u8g2.sendBuffer();
-    delay(2000); 
-    return;
+  if (!file) {
+    Serial.println("ERROR: SD open failed");
+    return "";
   }
 
-  // Write placeholder header (will be updated at end)
-  uint8_t header[44] = {0};
-  file.write(header, 44);
+  // Write header placeholder (dataSize = 0)
+  writeWavHeader44(file, SAMPLE_RATE, 0);
 
-  // Initial Draw
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.drawStr(20, 10, "RECORDING");
-  u8g2.drawLine(0, 15, 127, 15);
-  u8g2.setCursor(5, 30);
-  u8g2.print(teacherName.length() > 18 ? teacherName.substring(0, 15) + "..." : teacherName);
-  u8g2.setCursor(5, 45);
-  u8g2.print("File: " + filename.substring(folderPath.length() + 1));
-  u8g2.sendBuffer();
+  // Force audio to start at byte 44
+  file.seek(44);
 
-  // Buffer sizes for INMP441 32-bit processing
-  const int samples_to_read = 4096;  // Number of samples per read
-  const int i2s_buffer_size = samples_to_read * 4;  // 4 bytes per 32-bit sample
-  const int output_buffer_size = samples_to_read * 2;  // 2 bytes per 16-bit output
-  
-  int32_t *i2s_buff = (int32_t*) calloc(samples_to_read, sizeof(int32_t));
-  int16_t *output_buff = (int16_t*) calloc(samples_to_read, sizeof(int16_t));
-  
-  if (i2s_buff == NULL || output_buff == NULL) {
-    Serial.println("ERROR: Failed to allocate buffers!");
-    Serial.printf("  i2s_buff: %s\n", i2s_buff ? "OK" : "FAILED");
-    Serial.printf("  output_buff: %s\n", output_buff ? "OK" : "FAILED");
-    
-    if (i2s_buff) free(i2s_buff);
-    if (output_buff) free(output_buff);
+  // Init I2S
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("ERROR: i2s_driver_install failed");
     file.close();
-    
-    u8g2.setContrast(SCREEN_BRIGHT_LEVEL);
-    u8g2.clearBuffer(); 
-    u8g2.drawStr(10, 30, "Memory Error!"); 
-    u8g2.sendBuffer();
-    delay(2000); 
-    return;
+    return "";
   }
-  
-  Serial.printf("Buffers allocated: %d samples (%d bytes I2S, %d bytes output)\n", 
-                samples_to_read, i2s_buffer_size, output_buffer_size);
-  
-  size_t bytes_read;
-  
-  // Flush microphone buffer - INMP441 needs time to stabilize
-  Serial.println("Flushing INMP441 buffer (5 cycles)...");
-  for (int i = 0; i < 5; i++) {
-    esp_err_t result = i2s_read(I2S_PORT, i2s_buff, i2s_buffer_size, &bytes_read, 100);
-    if (result != ESP_OK) {
-      Serial.printf("  Flush cycle %d failed: %d\n", i + 1, result);
-    }
-    delay(100);
+
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
+    Serial.println("ERROR: i2s_set_pin failed");
+    i2s_driver_uninstall(I2S_PORT);
+    file.close();
+    return "";
   }
-  
-  // Zero the I2S DMA buffer
+
+  i2s_set_sample_rates(I2S_PORT, SAMPLE_RATE);
   i2s_zero_dma_buffer(I2S_PORT);
-  Serial.println("Microphone ready");
-  
-  Serial.println("Recording loop started...");
 
-  unsigned long recordingStart = millis();
-  unsigned long lastScreenUpdate = 0;
-  unsigned long totalBytesWritten = 0;
-  unsigned long totalSamplesProcessed = 0;
-  int debugCounter = 0;
-  int errorCount = 0;
-  
-  // --- RECORDING LOOP ---
-  while (true) {
-    // 1. Read 32-bit audio from INMP441
+  const int samples_to_read = 1024;
+  const int i2s_buffer_size = samples_to_read * 4;
+
+  int32_t *i2s_buff = (int32_t*) calloc(samples_to_read, sizeof(int32_t));
+  int16_t *out_buff = (int16_t*) calloc(samples_to_read, sizeof(int16_t));
+
+  if (!i2s_buff || !out_buff) {
+    Serial.println("ERROR: malloc failed");
+    if (i2s_buff) free(i2s_buff);
+    if (out_buff) free(out_buff);
+    i2s_driver_uninstall(I2S_PORT);
+    file.close();
+    return "";
+  }
+
+  unsigned long start = millis();
+  uint32_t totalAudioBytes = 0;
+
+  while (millis() - start < RECORD_TIME_MS) {
+    size_t bytes_read = 0;
     esp_err_t result = i2s_read(I2S_PORT, i2s_buff, i2s_buffer_size, &bytes_read, portMAX_DELAY);
-    
-    if (result != ESP_OK) {
-      errorCount++;
-      if (errorCount % 100 == 1) {  // Print every 100th error to avoid spam
-        Serial.printf("I2S read error: %d (count: %d)\n", result, errorCount);
-      }
-      continue;
-    }
-    
-    if (bytes_read == 0) {
-      errorCount++;
-      if (errorCount % 100 == 1) {
-        Serial.printf("Warning: 0 bytes read (count: %d)\n", errorCount);
-      }
-      continue;
-    }
-    
-    if (bytes_read % 4 != 0) {
-      Serial.printf("ERROR: Invalid byte count (not multiple of 4): %d\n", bytes_read);
-      continue;
-    }
-    
-    int samples_read = bytes_read / 4;  // 4 bytes per 32-bit sample
-    
-    // 2. Convert 32-bit to 16-bit
-    // INMP441 outputs 18-bit audio left-justified in 32-bit format
-    // We shift right by 14 bits to get the most significant 16 bits
+    if (result != ESP_OK || bytes_read == 0) continue;
+
+    int samples_read = bytes_read / 4;
+
+    // Convert 32-bit -> 16-bit PCM
     for (int i = 0; i < samples_read; i++) {
-      // Right shift by 14 bits to convert 32-bit to 16-bit
-      // This preserves the 18-bit audio data in the 16-bit output
-      output_buff[i] = (i2s_buff[i] >> 14);
+      out_buff[i] = (int16_t)(i2s_buff[i] >> 14);
     }
-    
-    // 3. Write 16-bit data to SD card
-    size_t bytes_to_write = samples_read * 2;  // 2 bytes per 16-bit sample
-    size_t bytes_written = file.write((const uint8_t*)output_buff, bytes_to_write);
-    
+
+    size_t bytes_to_write = samples_read * 2;
+    size_t bytes_written = file.write((uint8_t*)out_buff, bytes_to_write);
+
     if (bytes_written != bytes_to_write) {
-      Serial.printf("SD write error: wrote %d of %d bytes\n", bytes_written, bytes_to_write);
+      Serial.printf("SD write error: %d/%d\n", (int)bytes_written, (int)bytes_to_write);
+      break;
     }
-    
-    totalBytesWritten += bytes_written;
-    totalSamplesProcessed += samples_read;
 
-    unsigned long currentMillis = millis();
-    unsigned long duration = currentMillis - recordingStart;
+    totalAudioBytes += bytes_written;
 
-    // 4. Update Screen (Stays DIM)
-    if (currentMillis - lastScreenUpdate > 1000) {
-      lastScreenUpdate = currentMillis;
-      unsigned long seconds = duration / 1000;
-      u8g2.setDrawColor(0); 
-      u8g2.drawBox(70, 50, 58, 14); 
-      u8g2.setDrawColor(1);
-      u8g2.setCursor(70, 60); 
-      u8g2.printf("%02lu:%02lu", seconds / 60, seconds % 60);
-      u8g2.sendBuffer();
-      
-      // Debug output every 5 seconds
-      if (debugCounter % 5 == 0) {
-        Serial.printf("[%02lu:%02lu] Bytes: %lu | Samples: %lu | Errors: %d | Sample: %d\n", 
-                      seconds / 60, seconds % 60, totalBytesWritten, 
-                      totalSamplesProcessed, errorCount, output_buff[0]);
-      }
-      debugCounter++;
-    }
-    
-    // 5. Check Stop Button
-    if (digitalRead(BTN_SEL) == LOW || duration >= MAX_RECORD_TIME_MS) {
-      if (duration < MAX_RECORD_TIME_MS) { 
-        Serial.println("Stop button pressed");
-        delay(50); 
-        while(digitalRead(BTN_SEL) == LOW) delay(10); 
-      } else {
-        Serial.println("Maximum recording time reached");
-      }
-      break; 
+    static uint32_t lastFlush = 0;
+    if (millis() - lastFlush > 2000) {
+      file.flush();
+      lastFlush = millis();
     }
   }
 
-  Serial.println("Recording loop ended");
-  
-  // 2. GO BRIGHT (End of Recording)
-  u8g2.setContrast(SCREEN_BRIGHT_LEVEL); 
-  
-  // Clean up
+  // Cleanup
+  i2s_zero_dma_buffer(I2S_PORT);
+  i2s_driver_uninstall(I2S_PORT);
+
   free(i2s_buff);
-  free(output_buff);
-  Serial.println("Buffers freed");
-  
-  // Update WAV header with final file size
+  free(out_buff);
+
+  // Finalize header with real data size
   file.flush();
-  updateWavHeader(file);
+  writeWavHeader44(file, SAMPLE_RATE, totalAudioBytes);
+  file.flush();
   file.close();
-  
-  Serial.println("\n========== RECORDING STATISTICS ==========");
-  Serial.printf("Total bytes written: %lu\n", totalBytesWritten);
-  Serial.printf("Total samples: %lu\n", totalSamplesProcessed);
-  Serial.printf("Sample rate: %d Hz\n", SAMPLE_RATE);
-  Serial.printf("Expected duration: %.2f seconds\n", (float)totalBytesWritten / (SAMPLE_RATE * 2));
-  Serial.printf("I2S errors: %d\n", errorCount);
-  Serial.println("==========================================\n");
-  
-  unsigned long totalDuration = (millis() - recordingStart) / 1000;
-  u8g2.clearBuffer(); 
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(35, 25, "SAVED!");
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(25, 45);
-  u8g2.printf("Time: %lu:%02lu", totalDuration / 60, totalDuration % 60);
-  u8g2.sendBuffer();
-  delay(2000);
-  
-  currentMenu = MENU_TEACHER_SELECTED;
+
+  Serial.printf("Recording done. Audio bytes: %u  File size: %u\n",
+                totalAudioBytes, (unsigned)(totalAudioBytes + 44));
+
+  return filename;
 }
 
-void drawTeacherList() {
-  u8g2.clearBuffer(); 
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.drawStr(15, 10, "Select Teacher"); 
-  u8g2.drawLine(0, 12, 127, 12);
-  
-  int startIdx = currentSelection - 1;
-  if (startIdx < 0) startIdx = 0;
-  if (startIdx > 6) startIdx = 6;
-
-  for (int i = 0; i < 4; i++) {
-    int idx = startIdx + i;
-    if (idx >= 10) break;
-    int y = 25 + (i * 10);
-    if (idx == currentSelection) { 
-      u8g2.drawBox(0, y - 8, 128, 10); 
-      u8g2.setDrawColor(0); 
-    }
-    else { 
-      u8g2.setDrawColor(1); 
-    }
-    u8g2.setCursor(5, y); 
-    u8g2.print(TEACHER_NAMES[idx]);
+// =========================================================
+// UPLOAD (RAW HTTP BODY)
+// =========================================================
+bool uploadFileToLaptop_RAW(const String &path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("Upload: cannot open file");
+    return false;
   }
-  u8g2.setDrawColor(1); 
-  u8g2.sendBuffer();
+
+  // Sanity: first 4 bytes should be RIFF
+  uint8_t hdr[4];
+  f.read(hdr, 4);
+  f.seek(0);
+
+  if (!(hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F')) {
+    Serial.println("Upload: file is NOT WAV (missing RIFF). Not uploading.");
+    f.close();
+    return false;
+  }
+
+  WiFiClient client;
+  if (!client.connect(PI_HOST, PI_PORT)) {
+    Serial.println("Upload: cannot connect to laptop");
+    f.close();
+    return false;
+  }
+
+  String filename = path.substring(path.lastIndexOf("/") + 1);
+
+  client.printf(
+    "POST /upload_raw?device_id=%s&filename=%s HTTP/1.1\r\n",
+    DEVICE_ID,
+    filename.c_str()
+  );
+  client.printf("Host: %s\r\n", PI_HOST);
+  client.print("Content-Type: application/octet-stream\r\n");
+  client.printf("Content-Length: %u\r\n", (unsigned)f.size());
+  client.print("Connection: close\r\n\r\n");
+
+  uint8_t buf[2048];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n > 0) client.write(buf, n);
+  }
+
+  f.close();
+
+  unsigned long t0 = millis();
+  while (!client.available() && millis() - t0 < 15000) delay(10);
+
+  String resp;
+  while (client.available()) resp += (char)client.read();
+
+  Serial.println("Upload response:");
+  Serial.println(resp);
+
+  return resp.indexOf("200 OK") != -1;
 }
 
-void drawTeacherSelected() {
-  u8g2.clearBuffer(); 
-  u8g2.setFont(u8g2_font_6x10_tr);
-  String tName = String(TEACHER_NAMES[selectedTeacher]);
-  u8g2.setCursor((128 - (tName.length() > 20 ? 17 : tName.length()) * 6) / 2, 12);
-  u8g2.print(tName.length() > 20 ? tName.substring(0, 17) + "..." : tName);
-  u8g2.drawLine(0, 15, 127, 15);
-  
-  int option = currentSelection; 
-  if (option == 0) { 
-    u8g2.drawBox(5, 25, 118, 15); 
-    u8g2.setDrawColor(0); 
-  }
-  else { 
-    u8g2.setDrawColor(1); 
-    u8g2.drawFrame(5, 25, 118, 15); 
-  }
-  u8g2.drawStr(20, 36, "Start Recording");
-  
-  u8g2.setDrawColor(1);
-  if (option == 1) { 
-    u8g2.drawBox(5, 45, 118, 15); 
-    u8g2.setDrawColor(0); 
-  }
-  else { 
-    u8g2.drawFrame(5, 45, 118, 15); 
-  }
-  u8g2.drawStr(45, 56, "Back");
-  u8g2.setDrawColor(1); 
-  u8g2.sendBuffer();
-}
-
+// =========================================================
+// SETUP / LOOP
+// =========================================================
 void setup() {
-  // CPU @ 80MHz for power saving
-  setCpuFrequencyMhz(80);
-
   Serial.begin(115200);
   delay(500);
-  
-  Serial.println("\n\n");
-  Serial.println("================================================");
-  Serial.println("    Sweller ESP32 Audio Recorder v2.0");
-  Serial.println("    Optimized for INMP441 Microphone");
-  Serial.println("================================================");
-  
-  WiFi.mode(WIFI_OFF);
-  btStop();
-  Serial.println("WiFi and Bluetooth disabled");
-  
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
-  pinMode(BTN_SEL, INPUT_PULLUP);
-  Serial.println("Buttons configured");
 
-  u8g2.begin(); 
-  u8g2.setContrast(SCREEN_BRIGHT_LEVEL);
-  u8g2.clearBuffer(); 
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.drawStr(25, 30, "System Init..."); 
-  u8g2.sendBuffer();
-  Serial.println("OLED display initialized");
+  Serial.println("\nBooting...");
 
-  Serial.println("\nInitializing SPI for SD card...");
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  delay(200);
-
-  Serial.println("Initializing SD card...");
-  Serial.printf("  CS Pin: %d\n", SD_CS);
-  Serial.printf("  SCK Pin: %d\n", SD_SCK);
-  Serial.printf("  MISO Pin: %d\n", SD_MISO);
-  Serial.printf("  MOSI Pin: %d\n", SD_MOSI);
-  
-  if (!SD.begin(SD_CS, SPI, SD_SPI_FREQ)) {
-    Serial.println("ERROR: SD card initialization FAILED!");
-    Serial.println("Check:");
-    Serial.println("  - SD card is inserted");
-    Serial.println("  - Wiring is correct");
-    Serial.println("  - SD card is formatted (FAT32)");
-    
-    u8g2.clearBuffer(); 
-    u8g2.drawStr(20, 30, "SD FAIL!");
-    u8g2.sendBuffer(); 
-    while(1) delay(1000);
+  // SD init
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI, SD_SPI_FREQ)) {
+    Serial.println("SD init FAILED");
+    while (1) delay(1000);
   }
-  
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  Serial.printf("SD card initialized successfully - Size: %llu MB\n", cardSize);
 
-  Serial.println("\nInitializing INMP441 I2S microphone...");
-  Serial.println("CRITICAL: Verify INMP441 wiring:");
-  Serial.println("  L/R  -> GND (for LEFT channel)");
-  Serial.println("  WS   -> GPIO 25");
-  Serial.println("  SCK  -> GPIO 26");
-  Serial.println("  SD   -> GPIO 32");
-  Serial.println("  VDD  -> 3.3V");
-  Serial.println("  GND  -> GND");
-  
-  initI2S();
-  
-  u8g2.clearBuffer(); 
-  u8g2.drawStr(35, 30, "Ready!"); 
-  u8g2.sendBuffer();
-  delay(1000);
-  currentMenu = MENU_TEACHER_LIST;
-  
-  Serial.println("\n================================================");
-  Serial.println("System ready! Waiting for user input...");
-  Serial.println("Press SELECT to choose a teacher");
-  Serial.println("================================================\n");
+  Serial.println("SD OK");
+
+  wifiOff();
 }
 
 void loop() {
-  if (currentMenu == MENU_TEACHER_LIST) {
-    drawTeacherList();
-    
-    if (digitalRead(BTN_UP) == LOW) { 
-      if (currentSelection > 0) {
-        currentSelection--;
-        Serial.printf("Selected: %s\n", TEACHER_NAMES[currentSelection]);
-      }
-      delay(150); 
-    }
-    
-    if (digitalRead(BTN_DOWN) == LOW) { 
-      if (currentSelection < 9) {
-        currentSelection++;
-        Serial.printf("Selected: %s\n", TEACHER_NAMES[currentSelection]);
-      }
-      delay(150); 
-    }
-    
-    if (digitalRead(BTN_SEL) == LOW) {
-      delay(200); 
-      while(digitalRead(BTN_SEL) == LOW) delay(10);
-      selectedTeacher = currentSelection;
-      Serial.printf("Teacher chosen: %s\n", TEACHER_NAMES[selectedTeacher]);
-      currentSelection = 0; 
-      currentMenu = MENU_TEACHER_SELECTED;
-    }
+  // 1) Record fixed duration
+  String wavPath = recordFixedWav();
+  if (wavPath == "") {
+    Serial.println("Record failed, retrying in 5s");
+    delay(5000);
+    return;
   }
-  else if (currentMenu == MENU_TEACHER_SELECTED) {
-    drawTeacherSelected();
-    
-    if (digitalRead(BTN_UP) == LOW) { 
-      currentSelection = 0; 
-      delay(150); 
+
+  // 2) Upload
+  if (connectWiFi()) {
+    bool ok = uploadFileToLaptop_RAW(wavPath);
+    if (ok) {
+      markAsSent(wavPath);
+    } else {
+      Serial.println("Upload failed. Keeping file for retry later.");
     }
-    
-    if (digitalRead(BTN_DOWN) == LOW) { 
-      currentSelection = 1; 
-      delay(150); 
-    }
-    
-    if (digitalRead(BTN_SEL) == LOW) {
-      delay(200);
-      while(digitalRead(BTN_SEL) == LOW) delay(10);
-      
-      if (currentSelection == 0) {
-        Serial.printf("\nStarting recording for: %s\n", TEACHER_NAMES[selectedTeacher]);
-        recordAudio(String(TEACHER_NAMES[selectedTeacher]));
-      }
-      else { 
-        Serial.println("Returning to teacher list");
-        currentSelection = selectedTeacher; 
-        currentMenu = MENU_TEACHER_LIST; 
-      }
-    }
+  } else {
+    Serial.println("WiFi unavailable. Keeping file for retry later.");
   }
+
+  // 3) Wi-Fi off and repeat
+  wifiOff();
+  delay(2000);
 }
+
+
