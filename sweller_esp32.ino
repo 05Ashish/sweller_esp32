@@ -1,405 +1,414 @@
-// ========================= ESP32 CODE (Arduino IDE) =========================
-// ESP32 Classroom Audio Recorder + Auto Uploader (RAW)
-// - No buttons, no OLED
-// - On power: record fixed duration -> upload to laptop
-// - Upload method: RAW HTTP body (most reliable)
-// - After success: rename to .sent.wav
-
 #include <Arduino.h>
-#include <driver/i2s.h>
-#include <SD.h>
 #include <SPI.h>
+#include <SD.h>
+#include <driver/i2s.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <WiFi.h>
+#include <Adafruit_NeoPixel.h>
 
-// ------------------- YOUR DETAILS -------------------
-#define DEVICE_ID        "CLASSROOM_01"
-#define WIFI_SSID        "Airtel_NEGI"
-#define WIFI_PASS        "mnian281996"
+// ============================================================================
+// PIN DEFINITIONS
+// ============================================================================
+#define I2S_WS          4
+#define I2S_SCK         5
+#define I2S_SD          6
+#define I2S_PORT        I2S_NUM_0
 
-#define PI_HOST          "192.168.1.7"
-#define PI_PORT          8000
+#define SD_CS           10
+#define SD_SCK          12
+#define SD_MISO         13
+#define SD_MOSI         11
 
-// ------------------- RECORDING SETTINGS -------------------
-#define SAMPLE_RATE           16000
+#define ETH_CS          9
+#define ETH_SCK         36
+#define ETH_MISO        37
+#define ETH_MOSI        35
 
-// 3 minutes (testing)
-#define RECORD_TIME_MS        180000UL
+#define NEOPIXEL_PIN    48
+#define NEOPIXEL_COUNT  1
 
-// 30 minutes (final) -> use this instead when ready
-// #define RECORD_TIME_MS     1800000UL
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+#define SAMPLE_RATE         16000
+#define BITS_PER_SAMPLE     16
+#define I2S_BUFFER_SIZE     4096
+#define CHUNK_SIZE          2048        // Fixed W5500 2KB chunk limit
+#define MAX_RETRIES         3
+#define TIME_ZONE_OFFSET    19800       // IST is UTC + 5:30 (19800 seconds)
 
-// ------------------- SD SETTINGS -------------------
-#define SD_SPI_FREQ           10000000
+byte mac[6];
+IPAddress raspberryPi(192, 168, 1, 239); // YOUR PI'S ACTUAL ETHERNET IP
+const uint16_t raspberryPiPort = 5000;
 
-// ------------------- PINS (ESP32 WROVER typical) -------------------
-// INMP441 I2S
-#define I2S_WS   25
-#define I2S_SCK  26
-#define I2S_SD   32
-#define I2S_PORT I2S_NUM_0
+// --- STATUS LED COLORS ---
+#define COLOR_BOOT      0x0000FF  // Blue
+#define COLOR_RECORDING 0x00FF00  // Green
+#define COLOR_READY     0xFFFF00  // Yellow
+#define COLOR_UPLOADING 0xFF00FF  // Purple
+#define COLOR_ERROR     0xFF0000  // Red
+#define COLOR_IDLE      0x000000  // Off
 
-// SD Card SPI
-#define SD_CS    5
-#define SD_SCK   18
-#define SD_MISO  19
-#define SD_MOSI  23
+Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+EthernetClient ethClient;
+EthernetUDP Udp;
+SPIClass sdSPI(HSPI); 
 
-SPIClass sdSPI(VSPI);
-
-// =========================================================
-// WAV HEADER (44 bytes) - safe, no struct padding issues
-// =========================================================
-void writeWavHeader44(File &file, uint32_t sampleRate, uint32_t dataSize) {
-  uint32_t chunkSize = 36 + dataSize;
-  uint32_t byteRate  = sampleRate * 1 * 16 / 8;
-  uint16_t blockAlign = 1 * 16 / 8;
-
-  uint8_t h[44];
-
-  // RIFF
-  h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F';
-  h[4] = (chunkSize) & 0xFF;
-  h[5] = (chunkSize >> 8) & 0xFF;
-  h[6] = (chunkSize >> 16) & 0xFF;
-  h[7] = (chunkSize >> 24) & 0xFF;
-
-  // WAVE
-  h[8]  = 'W'; h[9]  = 'A'; h[10] = 'V'; h[11] = 'E';
-
-  // fmt
-  h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
-  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;   // PCM fmt chunk size
-  h[20] = 1;  h[21] = 0;                          // AudioFormat = 1 (PCM)
-  h[22] = 1;  h[23] = 0;                          // NumChannels = 1
-
-  // SampleRate
-  h[24] = (sampleRate) & 0xFF;
-  h[25] = (sampleRate >> 8) & 0xFF;
-  h[26] = (sampleRate >> 16) & 0xFF;
-  h[27] = (sampleRate >> 24) & 0xFF;
-
-  // ByteRate
-  h[28] = (byteRate) & 0xFF;
-  h[29] = (byteRate >> 8) & 0xFF;
-  h[30] = (byteRate >> 16) & 0xFF;
-  h[31] = (byteRate >> 24) & 0xFF;
-
-  // BlockAlign
-  h[32] = (blockAlign) & 0xFF;
-  h[33] = (blockAlign >> 8) & 0xFF;
-
-  // BitsPerSample
-  h[34] = 16; h[35] = 0;
-
-  // data
-  h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a';
-  h[40] = (dataSize) & 0xFF;
-  h[41] = (dataSize >> 8) & 0xFF;
-  h[42] = (dataSize >> 16) & 0xFF;
-  h[43] = (dataSize >> 24) & 0xFF;
-
-  file.seek(0);
-  file.write(h, 44);
-}
-
-// =========================================================
-// I2S CONFIG (INMP441)
-// =========================================================
-i2s_config_t i2s_config = {
-  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-  .sample_rate = SAMPLE_RATE,
-  .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-  .communication_format = I2S_COMM_FORMAT_I2S,
-  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-  .dma_buf_count = 8,
-  .dma_buf_len = 256,
-  .use_apll = false,
-  .tx_desc_auto_clear = false,
-  .fixed_mclk = 0
+// ============================================================================
+// TIMETABLE STRUCTURE (Minutes since Midnight)
+// ============================================================================
+struct ClassPeriod {
+  const char* name;
+  int startMin;
+  int endMin;
 };
 
-i2s_pin_config_t pin_config = {
-  .bck_io_num = I2S_SCK,
-  .ws_io_num = I2S_WS,
-  .data_out_num = -1,
-  .data_in_num = I2S_SD
+// 7:50 AM = (7 * 60) + 50 = 470
+ClassPeriod schedule[] = {
+  // --- REGULAR SCHEDULE ---
+  {"P1", 505, 540},  // 08:25 - 09:00
+  {"P2", 540, 575},  // 09:00 - 09:35
+  {"P3", 575, 610},  // 09:35 - 10:10
+  // LUNCH (10:10 - 10:40) skipped automatically
+  {"P4", 640, 675},  // 10:40 - 11:15
+  {"P5", 675, 710},  // 11:15 - 11:50
+  {"CT", 710, 740},  // 11:50 - 12:20
+
+  // --- 10-MINUTE TEST PERIODS (Ends at 4:00 PM) ---
+  {"T1", 740, 750},  // 12:20 - 12:30
+  {"T2", 750, 760},  // 12:30 - 12:40
+  {"T3", 760, 770},  // 12:40 - 12:50
+  {"T4", 770, 780},  // 12:50 - 13:00
+  {"T5", 780, 790},  // 13:00 - 13:10
+  {"T6", 790, 800},  // 13:10 - 13:20
+  {"T7", 800, 810},  // 13:20 - 13:30
+  {"T8", 810, 820},  // 13:30 - 13:40
+  {"T9", 820, 830},  // 13:40 - 13:50
+  {"T10", 830, 840}, // 13:50 - 14:00
+  {"T11", 840, 850}, // 14:00 - 14:10 
+  {"T12", 850, 860}, // 14:10 - 14:20
+  {"T13", 860, 870}, // 14:20 - 14:30
+  {"T14", 870, 880}, // 14:30 - 14:40
+  {"T15", 880, 890}, // 14:40 - 14:50
+  {"T16", 890, 900}, // 14:50 - 15:00
+  {"T17", 900, 910}, // 15:00 - 15:10
+  {"T18", 910, 920}, // 15:10 - 15:20
+  {"T19", 920, 930}, // 15:20 - 15:30
+  {"T20", 930, 940}, // 15:30 - 15:40
+  {"T21", 940, 950}, // 15:40 - 15:50
+  {"T22", 950, 960}  // 15:50 - 16:00
 };
 
-// =========================================================
-// HELPERS
-// =========================================================
-void wifiOff() {
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  delay(200);
-}
+const int numPeriods = 28;
 
-bool connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+// Global Time Variables
+unsigned long baseEpochTime = 0;
+unsigned long bootMillis = 0;
 
-  Serial.printf("WiFi connecting to: %s\n", WIFI_SSID);
+struct WavHeader {
+  char riff[4]; uint32_t fileSize; char wave[4]; char fmt[4];
+  uint32_t fmtSize; uint16_t audioFormat; uint16_t numChannels;
+  uint32_t sampleRate; uint32_t byteRate; uint16_t blockAlign;
+  uint16_t bitsPerSample; char data[4]; uint32_t dataSize;
+} __attribute__((packed));
 
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
+void setLED(uint32_t c) { pixel.setPixelColor(0, c); pixel.show(); }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK, IP: ");
-    Serial.println(WiFi.localIP());
-    return true;
-  }
+// ============================================================================
+// NTP TIME SYNC
+// ============================================================================
+unsigned long getNTPTime() {
+  const char timeServer[] = "pool.ntp.org";
+  byte packetBuffer[48];
+  memset(packetBuffer, 0, 48);
+  packetBuffer[0] = 0b11100011;   
+  packetBuffer[1] = 0; packetBuffer[2] = 6; packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49; packetBuffer[13] = 0x4E; packetBuffer[14] = 49; packetBuffer[15] = 52;
 
-  Serial.println("WiFi FAILED");
-  return false;
-}
+  Udp.begin(8888);
+  Udp.beginPacket(timeServer, 123);
+  Udp.write(packetBuffer, 48);
+  Udp.endPacket();
 
-String getNextFilename() {
-  // /rec/CLASSROOM_01_0001.wav
-  const char* folder = "/rec";
-  if (!SD.exists(folder)) SD.mkdir(folder);
-
-  for (int i = 1; i < 10000; i++) {
-    char name[64];
-    snprintf(name, sizeof(name), "/rec/%s_%04d.wav", DEVICE_ID, i);
-
-    String sentName = String(name);
-    sentName.replace(".wav", ".sent.wav");
-
-    if (!SD.exists(name) && !SD.exists(sentName)) {
-      return String(name);
+  unsigned long startWait = millis();
+  while (millis() - startWait < 3000) {
+    if (Udp.parsePacket()) {
+      Udp.read(packetBuffer, 48);
+      unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+      unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+      unsigned long secsSince1900 = highWord << 16 | lowWord;
+      const unsigned long seventyYears = 2208988800UL;
+      unsigned long epoch = secsSince1900 - seventyYears;
+      Udp.stop();
+      return epoch + TIME_ZONE_OFFSET; // Return local time (IST)
     }
+    delay(10);
   }
-  return "/rec/FAIL.wav";
+  Udp.stop();
+  return 0; // Sync failed
 }
 
-bool markAsSent(const String &path) {
-  String sentPath = path;
-  sentPath.replace(".wav", ".sent.wav");
-
-  if (SD.rename(path, sentPath)) {
-    Serial.printf("Marked sent: %s\n", sentPath.c_str());
-    return true;
-  }
-
-  Serial.println("Mark sent failed");
-  return false;
+int getCurrentMinuteOfDay() {
+  unsigned long currentEpoch = baseEpochTime + ((millis() - bootMillis) / 1000);
+  return (currentEpoch % 86400) / 60; // Returns 0 to 1439
 }
 
-// =========================================================
-// RECORDING
-// =========================================================
-String recordFixedWav() {
-  String filename = getNextFilename();
-  Serial.printf("\nRecording -> %s\n", filename.c_str());
-
-  // Ensure it doesn't exist (safety)
-  if (SD.exists(filename)) SD.remove(filename);
-
-  File file = SD.open(filename, FILE_WRITE);
-  if (!file) {
-    Serial.println("ERROR: SD open failed");
-    return "";
-  }
-
-  // Write header placeholder (dataSize = 0)
-  writeWavHeader44(file, SAMPLE_RATE, 0);
-
-  // Force audio to start at byte 44
-  file.seek(44);
-
-  // Init I2S
-  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
-    Serial.println("ERROR: i2s_driver_install failed");
-    file.close();
-    return "";
-  }
-
-  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
-    Serial.println("ERROR: i2s_set_pin failed");
-    i2s_driver_uninstall(I2S_PORT);
-    file.close();
-    return "";
-  }
-
-  i2s_set_sample_rates(I2S_PORT, SAMPLE_RATE);
-  i2s_zero_dma_buffer(I2S_PORT);
-
-  const int samples_to_read = 1024;
-  const int i2s_buffer_size = samples_to_read * 4;
-
-  int32_t *i2s_buff = (int32_t*) calloc(samples_to_read, sizeof(int32_t));
-  int16_t *out_buff = (int16_t*) calloc(samples_to_read, sizeof(int16_t));
-
-  if (!i2s_buff || !out_buff) {
-    Serial.println("ERROR: malloc failed");
-    if (i2s_buff) free(i2s_buff);
-    if (out_buff) free(out_buff);
-    i2s_driver_uninstall(I2S_PORT);
-    file.close();
-    return "";
-  }
-
-  unsigned long start = millis();
-  uint32_t totalAudioBytes = 0;
-
-  while (millis() - start < RECORD_TIME_MS) {
-    size_t bytes_read = 0;
-    esp_err_t result = i2s_read(I2S_PORT, i2s_buff, i2s_buffer_size, &bytes_read, portMAX_DELAY);
-    if (result != ESP_OK || bytes_read == 0) continue;
-
-    int samples_read = bytes_read / 4;
-
-    // Convert 32-bit -> 16-bit PCM
-    for (int i = 0; i < samples_read; i++) {
-      out_buff[i] = (int16_t)(i2s_buff[i] >> 14);
-    }
-
-    size_t bytes_to_write = samples_read * 2;
-    size_t bytes_written = file.write((uint8_t*)out_buff, bytes_to_write);
-
-    if (bytes_written != bytes_to_write) {
-      Serial.printf("SD write error: %d/%d\n", (int)bytes_written, (int)bytes_to_write);
-      break;
-    }
-
-    totalAudioBytes += bytes_written;
-
-    static uint32_t lastFlush = 0;
-    if (millis() - lastFlush > 2000) {
-      file.flush();
-      lastFlush = millis();
-    }
-  }
-
-  // Cleanup
-  i2s_zero_dma_buffer(I2S_PORT);
-  i2s_driver_uninstall(I2S_PORT);
-
-  free(i2s_buff);
-  free(out_buff);
-
-  // Finalize header with real data size
-  file.flush();
-  writeWavHeader44(file, SAMPLE_RATE, totalAudioBytes);
-  file.flush();
-  file.close();
-
-  Serial.printf("Recording done. Audio bytes: %u  File size: %u\n",
-                totalAudioBytes, (unsigned)(totalAudioBytes + 44));
-
-  return filename;
+long getCurrentSecondOfDay() {
+  unsigned long currentEpoch = baseEpochTime + ((millis() - bootMillis) / 1000);
+  return (currentEpoch % 86400); // Returns 0 to 86399
 }
 
-// =========================================================
-// UPLOAD (RAW HTTP BODY)
-// =========================================================
-bool uploadFileToLaptop_RAW(const String &path) {
-  File f = SD.open(path, FILE_READ);
-  if (!f) {
-    Serial.println("Upload: cannot open file");
-    return false;
-  }
-
-  // Sanity: first 4 bytes should be RIFF
-  uint8_t hdr[4];
-  f.read(hdr, 4);
-  f.seek(0);
-
-  if (!(hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F')) {
-    Serial.println("Upload: file is NOT WAV (missing RIFF). Not uploading.");
-    f.close();
-    return false;
-  }
-
-  WiFiClient client;
-  if (!client.connect(PI_HOST, PI_PORT)) {
-    Serial.println("Upload: cannot connect to laptop");
-    f.close();
-    return false;
-  }
-
-  String filename = path.substring(path.lastIndexOf("/") + 1);
-
-  client.printf(
-    "POST /upload_raw?device_id=%s&filename=%s HTTP/1.1\r\n",
-    DEVICE_ID,
-    filename.c_str()
-  );
-  client.printf("Host: %s\r\n", PI_HOST);
-  client.print("Content-Type: application/octet-stream\r\n");
-  client.printf("Content-Length: %u\r\n", (unsigned)f.size());
-  client.print("Connection: close\r\n\r\n");
-
-  uint8_t buf[2048];
-  while (f.available()) {
-    int n = f.read(buf, sizeof(buf));
-    if (n > 0) client.write(buf, n);
-  }
-
-  f.close();
-
-  unsigned long t0 = millis();
-  while (!client.available() && millis() - t0 < 15000) delay(10);
-
-  String resp;
-  while (client.available()) resp += (char)client.read();
-
-  Serial.println("Upload response:");
-  Serial.println(resp);
-
-  return resp.indexOf("200 OK") != -1;
-}
-
-// =========================================================
-// SETUP / LOOP
-// =========================================================
+// ============================================================================
+// SETUP
+// ============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(3000); 
+  Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
+  
+  pixel.begin(); setLED(COLOR_BOOT);
 
-  Serial.println("\nBooting...");
+  pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
+  pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
-  // SD init
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSPI, SD_SPI_FREQ)) {
-    Serial.println("SD init FAILED");
-    while (1) delay(1000);
+  // Initialize Ethernet
+  WiFi.mode(WIFI_STA); delay(100);
+  WiFi.macAddress(mac);
+  SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
+  Ethernet.init(ETH_CS);
+  
+  Serial.println("Requesting DHCP...");
+  while (Ethernet.begin(mac) == 0) {
+    Serial.println("DHCP Failed. Retrying in 5 seconds...");
+    delay(5000);
   }
+  Serial.print("Ethernet OK. IP: "); Serial.println(Ethernet.localIP());
 
-  Serial.println("SD OK");
+  // Sync Global Time
+  Serial.println("Syncing Time with NTP...");
+  while (baseEpochTime == 0) {
+    baseEpochTime = getNTPTime();
+    if (baseEpochTime == 0) {
+      Serial.println("NTP Sync failed. Retrying...");
+      delay(2000);
+    }
+  }
+  bootMillis = millis();
+  
+  int currentMin = getCurrentMinuteOfDay();
+  Serial.printf("Time Synced! Current Local Time: %02d:%02d\n", currentMin / 60, currentMin % 60);
 
-  wifiOff();
+  // Initialize SD Card
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI, 10000000)) {
+    Serial.println("SD PERMANENT FAILURE");
+    setLED(COLOR_ERROR);
+    while(1) delay(1000);
+  }
+  if (!SD.exists("/recordings")) SD.mkdir("/recordings");
+
+  // Initialize I2S
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024
+  };
+  i2s_pin_config_t pin_config = { .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = -1, .data_in_num = I2S_SD };
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  
+  Serial.println("System Ready. Waiting for next class...");
+  setLED(COLOR_IDLE);
 }
 
+// ============================================================================
+// MAIN TIMETABLE LOOP
+// ============================================================================
 void loop() {
-  // 1) Record fixed duration
-  String wavPath = recordFixedWav();
-  if (wavPath == "") {
-    Serial.println("Record failed, retrying in 5s");
-    delay(5000);
+  int currentMin = getCurrentMinuteOfDay();
+  long currentSec = getCurrentSecondOfDay();
+  
+  // Daily Time Resync (at 2:00 AM) to prevent millisecond drift
+  if (currentMin == 120 && (millis() - bootMillis > 86400000)) {
+     baseEpochTime = getNTPTime();
+     bootMillis = millis();
+  }
+
+  // Check the timetable to see if we should be recording right now
+  for (int i = 0; i < numPeriods; i++) {
+    // Stagger logic: 3 minutes (180s) + up to 60 extra seconds based on MAC address
+    long macOffset = mac[5] % 60; 
+    long uploadStartSec = (schedule[i].endMin * 60) - 180 - macOffset; 
+    long classStartSec = schedule[i].startMin * 60;
+
+    if (currentSec >= classStartSec && currentSec < uploadStartSec) {
+      Serial.printf("\n--- Class Started: %s ---\n", schedule[i].name);
+      
+      String filename = "/recordings/ROOM_A_" + String(schedule[i].name) + ".wav";
+      
+      // Pass the exact SECOND we want it to stop, rather than the minute
+      recordAudioFileUntil(filename, uploadStartSec);
+      
+      // Start upload sequence
+      setLED(COLOR_READY); delay(1000);
+      setLED(COLOR_UPLOADING);
+      
+      if (uploadFileToRaspberryPi(filename)) {
+        SD.remove(filename);
+        Serial.println("✓ Upload successful and file deleted.");
+      } else {
+        Serial.println("✗ Upload failed. Keeping file on SD.");
+      }
+      
+      // Wait until the period fully ends before scanning for the next one
+      while(getCurrentMinuteOfDay() < schedule[i].endMin) {
+        setLED(COLOR_IDLE);
+        delay(10000); 
+      }
+    }
+  }
+  delay(5000); 
+}
+
+// ============================================================================
+// CORE LOGIC FUNCTIONS
+// ============================================================================
+void recordAudioFileUntil(String filename, long stopSecond) {
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("✗ Failed to open file for recording.");
     return;
   }
 
-  // 2) Upload
-  if (connectWiFi()) {
-    bool ok = uploadFileToLaptop_RAW(wavPath);
-    if (ok) {
-      markAsSent(wavPath);
-    } else {
-      Serial.println("Upload failed. Keeping file for retry later.");
-    }
-  } else {
-    Serial.println("WiFi unavailable. Keeping file for retry later.");
-  }
+  // 1. Write an empty placeholder header to reserve the first 44 bytes
+  WavHeader header;
+  memset(&header, 0, sizeof(WavHeader));
+  file.write((uint8_t*)&header, sizeof(WavHeader));
 
-  // 3) Wi-Fi off and repeat
-  wifiOff();
-  delay(2000);
+  int32_t* i2sBuf = (int32_t*)malloc(I2S_BUFFER_SIZE);
+  int16_t* outBuf = (int16_t*)malloc(I2S_BUFFER_SIZE / 2);
+  
+  // Use a 32-bit unsigned int. This can count up to 4,294,967,295 bytes (4GB).
+  uint32_t totalDataBytesWritten = 0; 
+  
+  setLED(COLOR_RECORDING);
+  
+  // Calculate Hour, Minute, and Second for the debug print
+  int displayHour = stopSecond / 3600;
+  int displayMin = (stopSecond % 3600) / 60;
+  int displaySec = stopSecond % 60;
+  Serial.printf("Recording until %02d:%02d:%02d...\n", displayHour, displayMin, displaySec);
+
+  // 2. Loop and record using SECONDS instead of minutes
+  while (getCurrentSecondOfDay() < stopSecond) {
+    size_t bytesRead = 0;
+    
+    // Read from microphone
+    esp_err_t result = i2s_read(I2S_PORT, i2sBuf, I2S_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
+    
+    if (result == ESP_OK && bytesRead > 0) {
+      int samples = bytesRead / 4;
+      
+      // Downsample 32-bit to 16-bit
+      for (int i = 0; i < samples; i++) {
+        outBuf[i] = (int16_t)(i2sBuf[i] >> 14);
+      }
+      
+      // Write the 16-bit audio to the SD card
+      size_t written = file.write((uint8_t*)outBuf, samples * 2);
+      
+      // 3. Keep a strictly accurate count of every byte written
+      if (written > 0) {
+        totalDataBytesWritten += written;
+      }
+    }
+    yield();
+  }
+  
+  free(i2sBuf); free(outBuf);
+
+  // 4. Create the final, accurate WAV header using our byte count
+  WavHeader h;
+  memcpy(h.riff, "RIFF", 4); 
+  h.fileSize = totalDataBytesWritten + 36; // File size minus 8 bytes
+  memcpy(h.wave, "WAVE", 4); 
+  memcpy(h.fmt, "fmt ", 4);
+  h.fmtSize = 16; 
+  h.audioFormat = 1; 
+  h.numChannels = 1;
+  h.sampleRate = SAMPLE_RATE; 
+  h.bitsPerSample = BITS_PER_SAMPLE;
+  h.byteRate = SAMPLE_RATE * 2; 
+  h.blockAlign = 2;
+  memcpy(h.data, "data", 4); 
+  h.dataSize = totalDataBytesWritten; // Exact size of the audio data
+  
+  // 5. Rewind to byte 0 and overwrite the placeholder with the real header
+  file.seek(0); 
+  file.write((uint8_t*)&h, sizeof(WavHeader));
+  
+  // 6. Ensure everything is physically written to the SD card before closing
+  file.flush();
+  file.close();
+  
+  Serial.printf("✓ Recording Finished. Saved: %u MB\n", totalDataBytesWritten / (1024 * 1024));
 }
 
-
+bool uploadFileToRaspberryPi(String filename) {
+  Serial.printf("\n--- Uploading: %s ---\n", filename.c_str());
+  File file = SD.open(filename, FILE_READ);
+  if (!file) return false;
+  
+  size_t fileSize = file.size();
+  String baseName = filename.substring(filename.lastIndexOf('/') + 1);
+  
+  int retries = 0;
+  while (retries < MAX_RETRIES) {
+    if (ethClient.connect(raspberryPi, raspberryPiPort)) break;
+    retries++;
+    delay(2000);
+    if (retries >= MAX_RETRIES) { file.close(); return false; }
+  }
+  
+  ethClient.println("POST /upload HTTP/1.1");
+  ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
+  ethClient.println("Content-Type: audio/wav");
+  ethClient.printf("Content-Length: %u\r\n", fileSize);
+  ethClient.printf("X-Filename: %s\r\n", baseName.c_str());
+  ethClient.println("X-MD5: SKIP"); 
+  ethClient.printf("X-File-Size: %u\r\n", fileSize);
+  ethClient.println("Connection: close\r\n");
+  
+  uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE);
+  if (!buffer) { ethClient.stop(); file.close(); return false; }
+  
+  while (file.available()) {
+    size_t bytesRead = file.read(buffer, min((size_t)CHUNK_SIZE, (size_t)file.available()));
+    ethClient.write(buffer, bytesRead);
+    yield();
+  }
+  
+  ethClient.flush(); free(buffer); file.close();
+  
+  unsigned long timeout = millis();
+  while (!ethClient.available()) {
+    if (millis() - timeout > 60000 || !ethClient.connected()) { ethClient.stop(); return false; }
+    delay(100);
+  }
+  
+  String response = "";
+  timeout = millis();
+  while (ethClient.available() || (ethClient.connected() && millis() - timeout < 5000)) {
+    if (ethClient.available()) { response += (char)ethClient.read(); timeout = millis(); }
+    delay(1);
+  }
+  ethClient.stop();
+  
+  return (response.indexOf("200 OK") > 0 || response.indexOf("\"status\": \"success\"") > 0);
+}
