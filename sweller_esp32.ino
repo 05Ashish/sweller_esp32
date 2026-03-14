@@ -42,6 +42,12 @@ byte mac[6];
 IPAddress raspberryPi(192, 168, 1, 239); // YOUR PI'S ACTUAL ETHERNET IP
 const uint16_t raspberryPiPort = 5000;
 
+// --- ADD THESE 4 LINES ---
+IPAddress staticIP(192, 168, 1, 65);     // The forced IP for this ESP32
+IPAddress gateway(192, 168, 1, 1);       // Copied from your ipconfig
+IPAddress subnet(255, 255, 255, 0);      // Copied from your ipconfig
+IPAddress dns(8, 8, 8, 8);               // Google DNS (needed for NTP time sync)
+
 // --- STATUS LED COLORS ---
 #define COLOR_BOOT      0x0000FF  // Blue
 #define COLOR_RECORDING 0x00FF00  // Green
@@ -90,17 +96,17 @@ ClassPeriod schedule[] = {
   {"T12", 850, 860}, // 14:10 - 14:20
   {"T13", 860, 870}, // 14:20 - 14:30
   {"T14", 870, 880}, // 14:30 - 14:40
-  {"T15", 880, 890}, // 14:40 - 14:50
-  {"T16", 890, 900}, // 14:50 - 15:00
-  {"T17", 900, 910}, // 15:00 - 15:10
-  {"T18", 910, 920}, // 15:10 - 15:20
-  {"T19", 920, 930}, // 15:20 - 15:30
-  {"T20", 930, 940}, // 15:30 - 15:40
-  {"T21", 940, 950}, // 15:40 - 15:50
-  {"T22", 950, 960}  // 15:50 - 16:00
+  {"T15", 935, 965}, // 14:40 - 14:50
+  //{"T16", 890, 900}, // 14:50 - 15:00
+  //{"T17", 900, 910}, // 15:00 - 15:10
+  //{"T18", 910, 920}, // 15:10 - 15:20
+  //{"T19", 920, 930}, // 15:20 - 15:30
+  //{"T20", 930, 940}, // 15:30 - 15:40
+  //{"T21", 940, 950}, // 15:40 - 15:50
+  //{"T22", 950, 960}  // 15:50 - 16:00
 };
 
-const int numPeriods = 28;
+const int numPeriods = 21;
 
 // Global Time Variables
 unsigned long baseEpochTime = 0;
@@ -172,18 +178,21 @@ void setup() {
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
   pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
-  // Initialize Ethernet
+// Initialize Ethernet
   WiFi.mode(WIFI_STA); delay(100);
   WiFi.macAddress(mac);
   SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
   Ethernet.init(ETH_CS);
   
-  Serial.println("Requesting DHCP...");
-  while (Ethernet.begin(mac) == 0) {
-    Serial.println("DHCP Failed. Retrying in 5 seconds...");
-    delay(5000);
-  }
-  Serial.print("Ethernet OK. IP: "); Serial.println(Ethernet.localIP());
+  // --- REPLACE THE DHCP LOOP WITH THIS ---
+  Serial.println("Forcing Static IP (Bypassing DHCP)...");
+  Ethernet.begin(mac, staticIP, dns, gateway, subnet);
+  
+  // Give the school switch a few seconds to wake up the port
+  delay(5000); 
+  
+  Serial.print("Ethernet OK. Forced IP: "); 
+  Serial.println(Ethernet.localIP());
 
   // Sync Global Time
   Serial.println("Syncing Time with NTP...");
@@ -216,7 +225,7 @@ void setup() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
+    .dma_buf_count = 16,
     .dma_buf_len = 1024
   };
   i2s_pin_config_t pin_config = { .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = -1, .data_in_num = I2S_SD };
@@ -250,7 +259,7 @@ void loop() {
     if (currentSec >= classStartSec && currentSec < uploadStartSec) {
       Serial.printf("\n--- Class Started: %s ---\n", schedule[i].name);
       
-      String filename = "/recordings/ROOM_A_" + String(schedule[i].name) + ".wav";
+      String filename = "/recordings/ROOM_B_" + String(schedule[i].name) + ".wav";
       
       // Pass the exact SECOND we want it to stop, rather than the minute
       recordAudioFileUntil(filename, uploadStartSec);
