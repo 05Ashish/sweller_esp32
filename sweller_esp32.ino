@@ -6,7 +6,7 @@
 
 // ---------------- CONFIG ----------------
 
-const int CURRENT_VERSION = 10;
+const int CURRENT_VERSION = 11;
 
 #define ETH_CS    9
 #define ETH_SCK   36
@@ -121,7 +121,7 @@ void rgbFade()
   else if(g>0 && r==0){g--; b++;}
   else if(b>0 && g==0){b--; r++;}
 
-  delay(30);
+  delay(1);
 }
 
 // ---------------- SETUP ----------------
