@@ -2,25 +2,16 @@
 #include <SPI.h>
 #include <SD.h>
 #include <driver/i2s.h>
-#include <esp_task_wdt.h>
-#include <ETH.h>                 // --- NEW: Native ESP32 Ethernet ---
-#include <NetworkUDP.h>          // --- NEW: Native UDP ---
-#include <NetworkClient.h>       // --- NEW: Unencrypted Client (For the Pi) ---
-#include <NetworkClientSecure.h> // --- NEW: Encrypted Client (For GitHub) ---
-#include <HTTPClient.h>
-#include <HTTPUpdate.h>
-#include <Update.h>
+#include <Ethernet.h>        
+#include <EthernetUdp.h>
+#include <WiFi.h>
 #include <Adafruit_NeoPixel.h>
+#include <Update.h>
 
 // ============================================================================
-// GITHUB OTA CONFIGURATION
+// FIRMWARE VERSION
 // ============================================================================
-const int CURRENT_FIRMWARE_VERSION = 1; 
-
-// Replace YOUR_USERNAME and YOUR_REPO. 
-// MUST be the "raw.githubusercontent.com" links!
-const char* versionURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/main/version.txt";
-const char* binURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/main/build/esp32.esp32.esp32s3/sweller_esp32.ino.bin";
+const int CURRENT_FIRMWARE_VERSION = 1; // Increase this when updating via GitHub
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -35,7 +26,6 @@ const char* binURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/m
 #define SD_MISO         13
 #define SD_MOSI         11
 
-// W5500 SPI Pins
 #define ETH_CS          9
 #define ETH_SCK         36
 #define ETH_MISO        37
@@ -54,27 +44,33 @@ const char* binURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/m
 #define MAX_RETRIES         3
 #define TIME_ZONE_OFFSET    19800       // IST is UTC + 5:30 
 
-uint8_t mac[6]; // Used for stagger math
-IPAddress raspberryPi(192, 168, 1, 239);
+byte mac[6];
+IPAddress raspberryPi(192, 168, 1, 239); // The local Edge Server
 const uint16_t raspberryPiPort = 5000;
 
-IPAddress staticIP(192, 168, 1, 65);     // Change this to .152 for Room A!
+IPAddress staticIP(192, 168, 1, 152);    // Room A's IP
 IPAddress gateway(192, 168, 1, 1);       
 IPAddress subnet(255, 255, 255, 0);      
 IPAddress dns(8, 8, 8, 8);               
 
-// --- STATUS LED COLORS ---
-#define COLOR_BOOT      0x0000FF  // Blue
-#define COLOR_RECORDING 0x00FF00  // Green
-#define COLOR_READY     0xFFFF00  // Yellow
-#define COLOR_UPLOADING 0xFF00FF  // Purple
-#define COLOR_ERROR     0xFF0000  // Red
-#define COLOR_IDLE      0x000000  // Off
-#define COLOR_UPDATE    0x00FFFF  // Cyan (For OTA updates)
-
 Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-NetworkUDP Udp;
+EthernetClient ethClient;
+EthernetUDP Udp;
 SPIClass sdSPI(HSPI); 
+
+// ============================================================================
+// RGB FADE BACKGROUND TASK (FreeRTOS)
+// ============================================================================
+TaskHandle_t ledTaskHandle = NULL;
+
+void ledFadeTask(void * parameter) {
+  for(;;) {
+    uint16_t hue = (millis() * 15) % 65536; 
+    pixel.setPixelColor(0, pixel.ColorHSV(hue, 255, 150)); 
+    pixel.show();
+    vTaskDelay(20 / portTICK_PERIOD_MS); 
+  }
+}
 
 // ============================================================================
 // TIMETABLE STRUCTURE 
@@ -97,7 +93,6 @@ ClassPeriod schedule[] = {
 
 const int numPeriods = 21;
 
-// Global Time Variables
 unsigned long baseEpochTime = 0;
 unsigned long bootMillis = 0;
 
@@ -108,7 +103,65 @@ struct WavHeader {
   uint16_t bitsPerSample; char data[4]; uint32_t dataSize;
 } __attribute__((packed));
 
-void setLED(uint32_t c) { pixel.setPixelColor(0, c); pixel.show(); }
+// ============================================================================
+// LOCAL OTA UPDATE LOGIC
+// ============================================================================
+void checkForUpdates() {
+  Serial.printf("\nChecking Local Pi for updates (Current Version: %d)...\n", CURRENT_FIRMWARE_VERSION);
+  
+  if (ethClient.connect(raspberryPi, raspberryPiPort)) {
+    ethClient.println("GET /firmware/version.txt HTTP/1.1");
+    ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
+    ethClient.println("Connection: close\r\n");
+    
+    // Skip HTTP Headers
+    while (ethClient.connected()) {
+      String line = ethClient.readStringUntil('\n');
+      if (line == "\r") break; 
+    }
+    
+    String versionStr = ethClient.readStringUntil('\n');
+    versionStr.trim();
+    int availableVersion = versionStr.toInt();
+    ethClient.stop();
+    
+    if (availableVersion > CURRENT_FIRMWARE_VERSION) {
+      Serial.printf("New version %d found on Pi! Downloading...\n", availableVersion);
+      
+      if (ethClient.connect(raspberryPi, raspberryPiPort)) {
+        ethClient.println("GET /firmware/firmware.bin HTTP/1.1");
+        ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
+        ethClient.println("Connection: close\r\n");
+        
+        long contentLength = 0;
+        while (ethClient.connected()) {
+          String line = ethClient.readStringUntil('\n');
+          line.trim();
+          if (line.startsWith("Content-Length: ")) {
+            contentLength = line.substring(16).toInt();
+          }
+          if (line.length() == 0) break; // End of headers
+        }
+        
+        if (contentLength > 0 && Update.begin(contentLength)) {
+          size_t written = Update.writeStream(ethClient);
+          if (Update.end() && Update.isFinished()) {
+            Serial.println("OTA Update successfully completed! Rebooting...");
+            delay(1000);
+            ESP.restart(); 
+          } else {
+            Serial.printf("OTA Write Error #: %d\n", Update.getError());
+          }
+        }
+        ethClient.stop();
+      }
+    } else {
+      Serial.println("Firmware is up to date.");
+    }
+  } else {
+    Serial.println("Failed to connect to Pi for update check.");
+  }
+}
 
 // ============================================================================
 // NTP TIME SYNC
@@ -155,83 +208,31 @@ long getCurrentSecondOfDay() {
 }
 
 // ============================================================================
-// GITHUB OTA CHECK
-// ============================================================================
-void checkForUpdates() {
-  Serial.printf("\nChecking GitHub for updates (Current Version: %d)...\n", CURRENT_FIRMWARE_VERSION);
-  delay(10);  // Yield before network ops
-  
-  // 1. Declare the Secure Network Client
-  NetworkClientSecure secureClient;
-  secureClient.setInsecure(); // Bypass GitHub's Strict Root CA Check
-
-  HTTPClient http;
-  http.begin(secureClient, versionURL);
-  http.setTimeout(15000);  // 15s timeout for slow connections
-  int httpCode = http.GET();
-
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    int newVersion = payload.toInt();
-
-    if (newVersion > CURRENT_FIRMWARE_VERSION) {
-      Serial.printf("New version %d found! Starting OTA Download...\n", newVersion);
-      setLED(COLOR_UPDATE); // Cyan for OTA
-      
-      // Reset watchdog during OTA to prevent TG1WDT on long downloads
-      Update.onProgress([](size_t curr, size_t total) {
-        esp_task_wdt_reset();
-      });
-      
-      // 2. Pass the secure client into the HTTP updater
-      t_httpUpdate_return ret = httpUpdate.update(secureClient, binURL);
-
-      if (ret == HTTP_UPDATE_FAILED) {
-        Serial.printf("OTA Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-        setLED(COLOR_ERROR);
-        delay(2000);
-      }
-    } else {
-      Serial.println("Firmware is fully up to date.");
-    }
-  } else {
-    Serial.printf("GitHub Version Check Failed. HTTP Code: %d\n", httpCode);
-  }
-  http.end();
-}
-
-// ============================================================================
 // SETUP
 // ============================================================================
 void setup() {
   Serial.begin(115200);
   delay(3000); 
   Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
-  delay(10);  // Yield to prevent task watchdog during init
   
-  pixel.begin(); setLED(COLOR_BOOT);
-  delay(10);
+  pixel.begin(); 
+  xTaskCreatePinnedToCore(ledFadeTask, "LEDFade", 2048, NULL, 1, &ledTaskHandle, 0);
 
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
+  pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
-  // Initialize Native ETH.h for W5500
+  WiFi.mode(WIFI_STA); delay(100);
+  WiFi.macAddress(mac);
   SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
-  delay(10);
-  if (!ETH.begin(ETH_PHY_W5500, 1, ETH_CS, -1, -1, SPI)) {
-    Serial.println("ETH.begin failed");
-  }
-  delay(50);  // Let Ethernet driver tasks stabilize (prevents TG1WDT)
+  Ethernet.init(ETH_CS);
   
-  ETH.config(staticIP, gateway, subnet, dns);
-  delay(5000); // Give the switch time to wake the port
+  Serial.println("Forcing Static IP (Bypassing DHCP)...");
+  Ethernet.begin(mac, staticIP, dns, gateway, subnet);
+  delay(5000); 
   
   Serial.print("Ethernet OK. Forced IP: "); 
-  Serial.println(ETH.localIP());
-  
-  // Grab the MAC address for stagger logic
-  ETH.macAddress(mac);
+  Serial.println(Ethernet.localIP());
 
-  // Sync Global Time
   Serial.println("Syncing Time with NTP...");
   while (baseEpochTime == 0) {
     baseEpochTime = getNTPTime();
@@ -239,27 +240,22 @@ void setup() {
       Serial.println("NTP Sync failed. Retrying...");
       delay(2000);
     }
-    delay(10);  // Yield to prevent task watchdog during retry loop
   }
   bootMillis = millis();
   
   int currentMin = getCurrentMinuteOfDay();
   Serial.printf("Time Synced! Current Local Time: %02d:%02d\n", currentMin / 60, currentMin % 60);
 
-  // --- CHECK GITHUB FOR UPDATES EVERY BOOT ---
+  // --- CHECK THE PI FOR UPDATES EVERY BOOT ---
   checkForUpdates();
-  delay(10);
 
-  // Initialize SD Card
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSPI, 10000000)) {
     Serial.println("SD PERMANENT FAILURE");
-    setLED(COLOR_ERROR);
     while(1) delay(1000);
   }
   if (!SD.exists("/recordings")) SD.mkdir("/recordings");
 
-  // Initialize I2S
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
@@ -273,10 +269,8 @@ void setup() {
   i2s_pin_config_t pin_config = { .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = -1, .data_in_num = I2S_SD };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
-  delay(10);
   
   Serial.println("System Ready. Waiting for next class...");
-  setLED(COLOR_IDLE);
 }
 
 // ============================================================================
@@ -286,7 +280,6 @@ void loop() {
   int currentMin = getCurrentMinuteOfDay();
   long currentSec = getCurrentSecondOfDay();
   
-  // Daily Time Resync (at 2:00 AM) to prevent millisecond drift
   if (currentMin == 120 && (millis() - bootMillis > 86400000)) {
      baseEpochTime = getNTPTime();
      bootMillis = millis();
@@ -299,25 +292,20 @@ void loop() {
 
     if (currentSec >= classStartSec && currentSec < uploadStartSec) {
       Serial.printf("\n--- Class Started: %s ---\n", schedule[i].name);
-      
-      String filename = "/recordings/ROOM_B_" + String(schedule[i].name) + ".wav";
+      String filename = "/recordings/ROOM_A_" + String(schedule[i].name) + ".wav";
       
       recordAudioFileUntil(filename, uploadStartSec);
-      
-      setLED(COLOR_READY); delay(1000);
-      setLED(COLOR_UPLOADING);
+      delay(1000);
       
       if (uploadFileToRaspberryPi(filename)) {
         SD.remove(filename);
         Serial.println("✓ Upload successful and file deleted.");
       } else {
         Serial.println("✗ Upload failed. Keeping file on SD.");
-        setLED(COLOR_ERROR); 
         delay(3000);
       }
       
       while(getCurrentMinuteOfDay() < schedule[i].endMin) {
-        setLED(COLOR_IDLE);
         delay(10000); 
       }
     }
@@ -343,7 +331,6 @@ void recordAudioFileUntil(String filename, long stopSecond) {
   int16_t* outBuf = (int16_t*)malloc(I2S_BUFFER_SIZE / 2);
   
   uint32_t totalDataBytesWritten = 0; 
-  setLED(COLOR_RECORDING);
   
   int displayHour = stopSecond / 3600;
   int displayMin = (stopSecond % 3600) / 60;
@@ -395,57 +382,55 @@ bool uploadFileToRaspberryPi(String filename) {
   size_t fileSize = file.size();
   String baseName = filename.substring(filename.lastIndexOf('/') + 1);
   
-  // Create a fast, unencrypted client for the local Raspberry Pi
-  NetworkClient localClient; 
-  
   int retries = 0;
   while (retries < MAX_RETRIES) {
-    if (localClient.connect(raspberryPi, raspberryPiPort)) break;
+    if (ethClient.connect(raspberryPi, raspberryPiPort)) break;
     retries++;
     delay(2000);
     if (retries >= MAX_RETRIES) { file.close(); return false; }
   }
   
-  localClient.println("POST /upload HTTP/1.1");
-  localClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
-  localClient.println("Content-Type: audio/wav");
-  localClient.printf("Content-Length: %u\r\n", fileSize);
-  localClient.printf("X-Filename: %s\r\n", baseName.c_str());
-  localClient.println("X-MD5: SKIP"); 
-  localClient.printf("X-File-Size: %u\r\n", fileSize);
-  localClient.println("Connection: close\r\n\r\n"); 
+  ethClient.println("POST /upload HTTP/1.1");
+  ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
+  ethClient.println("Content-Type: audio/wav");
+  ethClient.printf("Content-Length: %u\r\n", fileSize);
+  ethClient.printf("X-Filename: %s\r\n", baseName.c_str());
+  ethClient.println("X-MD5: SKIP"); 
+  ethClient.printf("X-File-Size: %u\r\n", fileSize);
+  ethClient.println("Connection: close\r\n\r\n"); 
   
   uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE);
-  if (!buffer) { localClient.stop(); file.close(); return false; }
+  if (!buffer) { ethClient.stop(); file.close(); return false; }
   
   unsigned long uploadStart = millis();
   
   while (file.available()) {
+    // --- 5 MINUTE NETWORK TIMEOUT FAILSAFE ---
     if (millis() - uploadStart > 300000) { 
       Serial.println("✗ NETWORK TIMEOUT: Upload took longer than 5 minutes.");
-      localClient.stop(); free(buffer); file.close(); return false; 
+      ethClient.stop(); free(buffer); file.close(); return false; 
     }
     
     size_t bytesRead = file.read(buffer, min((size_t)CHUNK_SIZE, (size_t)file.available()));
-    localClient.write(buffer, bytesRead);
+    ethClient.write(buffer, bytesRead);
     yield();
   }
   
-  localClient.flush(); free(buffer); file.close();
+  ethClient.flush(); free(buffer); file.close();
   
   unsigned long timeout = millis();
-  while (!localClient.available()) {
-    if (millis() - timeout > 60000 || !localClient.connected()) { localClient.stop(); return false; }
+  while (!ethClient.available()) {
+    if (millis() - timeout > 60000 || !ethClient.connected()) { ethClient.stop(); return false; }
     delay(100);
   }
   
   String response = "";
   timeout = millis();
-  while (localClient.available() || (localClient.connected() && millis() - timeout < 5000)) {
-    if (localClient.available()) { response += (char)localClient.read(); timeout = millis(); }
+  while (ethClient.available() || (ethClient.connected() && millis() - timeout < 5000)) {
+    if (ethClient.available()) { response += (char)ethClient.read(); timeout = millis(); }
     delay(1);
   }
-  localClient.stop();
+  ethClient.stop();
   
   return (response.indexOf("200 OK") > 0 || response.indexOf("\"status\": \"success\"") > 0);
 }
