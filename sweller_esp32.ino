@@ -2,10 +2,23 @@
 #include <SPI.h>
 #include <SD.h>
 #include <driver/i2s.h>
-#include <Ethernet.h>
-#include <EthernetUdp.h>
-#include <WiFi.h>
+#include <ETH.h>                 // --- NEW: Native ESP32 Ethernet ---
+#include <NetworkUDP.h>          // --- NEW: Native UDP ---
+#include <NetworkClient.h>       // --- NEW: Unencrypted Client (For the Pi) ---
+#include <NetworkClientSecure.h> // --- NEW: Encrypted Client (For GitHub) ---
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Adafruit_NeoPixel.h>
+
+// ============================================================================
+// GITHUB OTA CONFIGURATION
+// ============================================================================
+const int CURRENT_FIRMWARE_VERSION = 1; 
+
+// Replace YOUR_USERNAME and YOUR_REPO. 
+// MUST be the "raw.githubusercontent.com" links!
+const char* versionURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/main/version.txt";
+const char* binURL = "https://raw.githubusercontent.com/05Ashish/sweller_esp32/main/build/esp32.esp32.esp32s3/sweller_esp32.ino.bin";
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -20,6 +33,7 @@
 #define SD_MISO         13
 #define SD_MOSI         11
 
+// W5500 SPI Pins
 #define ETH_CS          9
 #define ETH_SCK         36
 #define ETH_MISO        37
@@ -34,19 +48,18 @@
 #define SAMPLE_RATE         16000
 #define BITS_PER_SAMPLE     16
 #define I2S_BUFFER_SIZE     4096
-#define CHUNK_SIZE          2048        // Fixed W5500 2KB chunk limit
+#define CHUNK_SIZE          2048
 #define MAX_RETRIES         3
-#define TIME_ZONE_OFFSET    19800       // IST is UTC + 5:30 (19800 seconds)
+#define TIME_ZONE_OFFSET    19800       // IST is UTC + 5:30 
 
-byte mac[6];
-IPAddress raspberryPi(192, 168, 1, 239); // YOUR PI'S ACTUAL ETHERNET IP
+uint8_t mac[6]; // Used for stagger math
+IPAddress raspberryPi(192, 168, 1, 239);
 const uint16_t raspberryPiPort = 5000;
 
-// --- ADD THESE 4 LINES ---
-IPAddress staticIP(192, 168, 1, 65);     // The forced IP for this ESP32
-IPAddress gateway(192, 168, 1, 1);       // Copied from your ipconfig
-IPAddress subnet(255, 255, 255, 0);      // Copied from your ipconfig
-IPAddress dns(8, 8, 8, 8);               // Google DNS (needed for NTP time sync)
+IPAddress staticIP(192, 168, 1, 65);     // Change this to .152 for Room A!
+IPAddress gateway(192, 168, 1, 1);       
+IPAddress subnet(255, 255, 255, 0);      
+IPAddress dns(8, 8, 8, 8);               
 
 // --- STATUS LED COLORS ---
 #define COLOR_BOOT      0x0000FF  // Blue
@@ -55,14 +68,14 @@ IPAddress dns(8, 8, 8, 8);               // Google DNS (needed for NTP time sync
 #define COLOR_UPLOADING 0xFF00FF  // Purple
 #define COLOR_ERROR     0xFF0000  // Red
 #define COLOR_IDLE      0x000000  // Off
+#define COLOR_UPDATE    0x00FFFF  // Cyan (For OTA updates)
 
 Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-EthernetClient ethClient;
-EthernetUDP Udp;
+NetworkUDP Udp;
 SPIClass sdSPI(HSPI); 
 
 // ============================================================================
-// TIMETABLE STRUCTURE (Minutes since Midnight)
+// TIMETABLE STRUCTURE 
 // ============================================================================
 struct ClassPeriod {
   const char* name;
@@ -70,40 +83,14 @@ struct ClassPeriod {
   int endMin;
 };
 
-// 7:50 AM = (7 * 60) + 50 = 470
 ClassPeriod schedule[] = {
-  // --- REGULAR SCHEDULE ---
-  {"P1", 505, 540},  // 08:25 - 09:00
-  {"P2", 540, 575},  // 09:00 - 09:35
-  {"P3", 575, 610},  // 09:35 - 10:10
-  // LUNCH (10:10 - 10:40) skipped automatically
-  {"P4", 640, 675},  // 10:40 - 11:15
-  {"P5", 675, 710},  // 11:15 - 11:50
-  {"CT", 710, 740},  // 11:50 - 12:20
-
-  // --- 10-MINUTE TEST PERIODS (Ends at 4:00 PM) ---
-  {"T1", 740, 750},  // 12:20 - 12:30
-  {"T2", 750, 760},  // 12:30 - 12:40
-  {"T3", 760, 770},  // 12:40 - 12:50
-  {"T4", 770, 780},  // 12:50 - 13:00
-  {"T5", 780, 790},  // 13:00 - 13:10
-  {"T6", 790, 800},  // 13:10 - 13:20
-  {"T7", 800, 810},  // 13:20 - 13:30
-  {"T8", 810, 820},  // 13:30 - 13:40
-  {"T9", 820, 830},  // 13:40 - 13:50
-  {"T10", 830, 840}, // 13:50 - 14:00
-  {"T11", 840, 850}, // 14:00 - 14:10 
-  {"T12", 850, 860}, // 14:10 - 14:20
-  {"T13", 860, 870}, // 14:20 - 14:30
-  {"T14", 870, 880}, // 14:30 - 14:40
-  {"T15", 935, 965}, // 14:40 - 14:50
-  //{"T16", 890, 900}, // 14:50 - 15:00
-  //{"T17", 900, 910}, // 15:00 - 15:10
-  //{"T18", 910, 920}, // 15:10 - 15:20
-  //{"T19", 920, 930}, // 15:20 - 15:30
-  //{"T20", 930, 940}, // 15:30 - 15:40
-  //{"T21", 940, 950}, // 15:40 - 15:50
-  //{"T22", 950, 960}  // 15:50 - 16:00
+  {"P1", 505, 540},  {"P2", 540, 575},  {"P3", 575, 610},  
+  {"P4", 640, 675},  {"P5", 675, 710},  {"CT", 710, 740},  
+  {"T1", 740, 750},  {"T2", 750, 760},  {"T3", 760, 770},  
+  {"T4", 770, 780},  {"T5", 780, 790},  {"T6", 790, 800},  
+  {"T7", 800, 810},  {"T8", 810, 820},  {"T9", 820, 830},  
+  {"T10", 830, 840}, {"T11", 840, 850}, {"T12", 850, 860}, 
+  {"T13", 860, 870}, {"T14", 870, 880}, {"T15", 935, 965}
 };
 
 const int numPeriods = 21;
@@ -147,22 +134,61 @@ unsigned long getNTPTime() {
       const unsigned long seventyYears = 2208988800UL;
       unsigned long epoch = secsSince1900 - seventyYears;
       Udp.stop();
-      return epoch + TIME_ZONE_OFFSET; // Return local time (IST)
+      return epoch + TIME_ZONE_OFFSET; 
     }
     delay(10);
   }
   Udp.stop();
-  return 0; // Sync failed
+  return 0; 
 }
 
 int getCurrentMinuteOfDay() {
   unsigned long currentEpoch = baseEpochTime + ((millis() - bootMillis) / 1000);
-  return (currentEpoch % 86400) / 60; // Returns 0 to 1439
+  return (currentEpoch % 86400) / 60; 
 }
 
 long getCurrentSecondOfDay() {
   unsigned long currentEpoch = baseEpochTime + ((millis() - bootMillis) / 1000);
-  return (currentEpoch % 86400); // Returns 0 to 86399
+  return (currentEpoch % 86400); 
+}
+
+// ============================================================================
+// GITHUB OTA CHECK
+// ============================================================================
+void checkForUpdates() {
+  Serial.printf("\nChecking GitHub for updates (Current Version: %d)...\n", CURRENT_FIRMWARE_VERSION);
+  
+  // 1. Declare the Secure Network Client
+  NetworkClientSecure secureClient;
+  secureClient.setInsecure(); // Bypass GitHub's Strict Root CA Check
+
+  HTTPClient http;
+  http.begin(secureClient, versionURL);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    int newVersion = payload.toInt();
+
+    if (newVersion > CURRENT_FIRMWARE_VERSION) {
+      Serial.printf("New version %d found! Starting OTA Download...\n", newVersion);
+      setLED(COLOR_UPDATE); // Cyan for OTA
+      
+      // 2. Pass the secure client into the HTTP updater
+      t_httpUpdate_return ret = httpUpdate.update(secureClient, binURL);
+
+      if (ret == HTTP_UPDATE_FAILED) {
+        Serial.printf("OTA Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        setLED(COLOR_ERROR);
+        delay(2000);
+      }
+    } else {
+      Serial.println("Firmware is fully up to date.");
+    }
+  } else {
+    Serial.printf("GitHub Version Check Failed. HTTP Code: %d\n", httpCode);
+  }
+  http.end();
 }
 
 // ============================================================================
@@ -176,23 +202,21 @@ void setup() {
   pixel.begin(); setLED(COLOR_BOOT);
 
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
-  pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
-// Initialize Ethernet
-  WiFi.mode(WIFI_STA); delay(100);
-  WiFi.macAddress(mac);
+  // Initialize Native ETH.h for W5500
   SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
-  Ethernet.init(ETH_CS);
+  if (!ETH.begin(ETH_PHY_W5500, 1, ETH_CS, -1, -1, SPI)) {
+    Serial.println("ETH.begin failed");
+  }
   
-  // --- REPLACE THE DHCP LOOP WITH THIS ---
-  Serial.println("Forcing Static IP (Bypassing DHCP)...");
-  Ethernet.begin(mac, staticIP, dns, gateway, subnet);
-  
-  // Give the school switch a few seconds to wake up the port
-  delay(5000); 
+  ETH.config(staticIP, gateway, subnet, dns);
+  delay(5000); // Give the switch time to wake the port
   
   Serial.print("Ethernet OK. Forced IP: "); 
-  Serial.println(Ethernet.localIP());
+  Serial.println(ETH.localIP());
+  
+  // Grab the MAC address for stagger logic
+  ETH.macAddress(mac);
 
   // Sync Global Time
   Serial.println("Syncing Time with NTP...");
@@ -207,6 +231,9 @@ void setup() {
   
   int currentMin = getCurrentMinuteOfDay();
   Serial.printf("Time Synced! Current Local Time: %02d:%02d\n", currentMin / 60, currentMin % 60);
+
+  // --- CHECK GITHUB FOR UPDATES EVERY BOOT ---
+  checkForUpdates();
 
   // Initialize SD Card
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -249,9 +276,7 @@ void loop() {
      bootMillis = millis();
   }
 
-  // Check the timetable to see if we should be recording right now
   for (int i = 0; i < numPeriods; i++) {
-    // Stagger logic: 3 minutes (180s) + up to 60 extra seconds based on MAC address
     long macOffset = mac[5] % 60; 
     long uploadStartSec = (schedule[i].endMin * 60) - 180 - macOffset; 
     long classStartSec = schedule[i].startMin * 60;
@@ -261,10 +286,8 @@ void loop() {
       
       String filename = "/recordings/ROOM_B_" + String(schedule[i].name) + ".wav";
       
-      // Pass the exact SECOND we want it to stop, rather than the minute
       recordAudioFileUntil(filename, uploadStartSec);
       
-      // Start upload sequence
       setLED(COLOR_READY); delay(1000);
       setLED(COLOR_UPLOADING);
       
@@ -273,9 +296,10 @@ void loop() {
         Serial.println("✓ Upload successful and file deleted.");
       } else {
         Serial.println("✗ Upload failed. Keeping file on SD.");
+        setLED(COLOR_ERROR); 
+        delay(3000);
       }
       
-      // Wait until the period fully ends before scanning for the next one
       while(getCurrentMinuteOfDay() < schedule[i].endMin) {
         setLED(COLOR_IDLE);
         delay(10000); 
@@ -295,7 +319,6 @@ void recordAudioFileUntil(String filename, long stopSecond) {
     return;
   }
 
-  // 1. Write an empty placeholder header to reserve the first 44 bytes
   WavHeader header;
   memset(&header, 0, sizeof(WavHeader));
   file.write((uint8_t*)&header, sizeof(WavHeader));
@@ -303,36 +326,24 @@ void recordAudioFileUntil(String filename, long stopSecond) {
   int32_t* i2sBuf = (int32_t*)malloc(I2S_BUFFER_SIZE);
   int16_t* outBuf = (int16_t*)malloc(I2S_BUFFER_SIZE / 2);
   
-  // Use a 32-bit unsigned int. This can count up to 4,294,967,295 bytes (4GB).
   uint32_t totalDataBytesWritten = 0; 
-  
   setLED(COLOR_RECORDING);
   
-  // Calculate Hour, Minute, and Second for the debug print
   int displayHour = stopSecond / 3600;
   int displayMin = (stopSecond % 3600) / 60;
   int displaySec = stopSecond % 60;
   Serial.printf("Recording until %02d:%02d:%02d...\n", displayHour, displayMin, displaySec);
 
-  // 2. Loop and record using SECONDS instead of minutes
   while (getCurrentSecondOfDay() < stopSecond) {
     size_t bytesRead = 0;
-    
-    // Read from microphone
     esp_err_t result = i2s_read(I2S_PORT, i2sBuf, I2S_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
     
     if (result == ESP_OK && bytesRead > 0) {
       int samples = bytesRead / 4;
-      
-      // Downsample 32-bit to 16-bit
       for (int i = 0; i < samples; i++) {
         outBuf[i] = (int16_t)(i2sBuf[i] >> 14);
       }
-      
-      // Write the 16-bit audio to the SD card
       size_t written = file.write((uint8_t*)outBuf, samples * 2);
-      
-      // 3. Keep a strictly accurate count of every byte written
       if (written > 0) {
         totalDataBytesWritten += written;
       }
@@ -342,27 +353,18 @@ void recordAudioFileUntil(String filename, long stopSecond) {
   
   free(i2sBuf); free(outBuf);
 
-  // 4. Create the final, accurate WAV header using our byte count
   WavHeader h;
   memcpy(h.riff, "RIFF", 4); 
-  h.fileSize = totalDataBytesWritten + 36; // File size minus 8 bytes
+  h.fileSize = totalDataBytesWritten + 36; 
   memcpy(h.wave, "WAVE", 4); 
   memcpy(h.fmt, "fmt ", 4);
-  h.fmtSize = 16; 
-  h.audioFormat = 1; 
-  h.numChannels = 1;
-  h.sampleRate = SAMPLE_RATE; 
-  h.bitsPerSample = BITS_PER_SAMPLE;
-  h.byteRate = SAMPLE_RATE * 2; 
-  h.blockAlign = 2;
-  memcpy(h.data, "data", 4); 
-  h.dataSize = totalDataBytesWritten; // Exact size of the audio data
+  h.fmtSize = 16; h.audioFormat = 1; h.numChannels = 1;
+  h.sampleRate = SAMPLE_RATE; h.bitsPerSample = BITS_PER_SAMPLE;
+  h.byteRate = SAMPLE_RATE * 2; h.blockAlign = 2;
+  memcpy(h.data, "data", 4); h.dataSize = totalDataBytesWritten; 
   
-  // 5. Rewind to byte 0 and overwrite the placeholder with the real header
   file.seek(0); 
   file.write((uint8_t*)&h, sizeof(WavHeader));
-  
-  // 6. Ensure everything is physically written to the SD card before closing
   file.flush();
   file.close();
   
@@ -377,47 +379,57 @@ bool uploadFileToRaspberryPi(String filename) {
   size_t fileSize = file.size();
   String baseName = filename.substring(filename.lastIndexOf('/') + 1);
   
+  // Create a fast, unencrypted client for the local Raspberry Pi
+  NetworkClient localClient; 
+  
   int retries = 0;
   while (retries < MAX_RETRIES) {
-    if (ethClient.connect(raspberryPi, raspberryPiPort)) break;
+    if (localClient.connect(raspberryPi, raspberryPiPort)) break;
     retries++;
     delay(2000);
     if (retries >= MAX_RETRIES) { file.close(); return false; }
   }
   
-  ethClient.println("POST /upload HTTP/1.1");
-  ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
-  ethClient.println("Content-Type: audio/wav");
-  ethClient.printf("Content-Length: %u\r\n", fileSize);
-  ethClient.printf("X-Filename: %s\r\n", baseName.c_str());
-  ethClient.println("X-MD5: SKIP"); 
-  ethClient.printf("X-File-Size: %u\r\n", fileSize);
-  ethClient.println("Connection: close\r\n");
+  localClient.println("POST /upload HTTP/1.1");
+  localClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
+  localClient.println("Content-Type: audio/wav");
+  localClient.printf("Content-Length: %u\r\n", fileSize);
+  localClient.printf("X-Filename: %s\r\n", baseName.c_str());
+  localClient.println("X-MD5: SKIP"); 
+  localClient.printf("X-File-Size: %u\r\n", fileSize);
+  localClient.println("Connection: close\r\n\r\n"); 
   
   uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE);
-  if (!buffer) { ethClient.stop(); file.close(); return false; }
+  if (!buffer) { localClient.stop(); file.close(); return false; }
+  
+  unsigned long uploadStart = millis();
   
   while (file.available()) {
+    if (millis() - uploadStart > 300000) { 
+      Serial.println("✗ NETWORK TIMEOUT: Upload took longer than 5 minutes.");
+      localClient.stop(); free(buffer); file.close(); return false; 
+    }
+    
     size_t bytesRead = file.read(buffer, min((size_t)CHUNK_SIZE, (size_t)file.available()));
-    ethClient.write(buffer, bytesRead);
+    localClient.write(buffer, bytesRead);
     yield();
   }
   
-  ethClient.flush(); free(buffer); file.close();
+  localClient.flush(); free(buffer); file.close();
   
   unsigned long timeout = millis();
-  while (!ethClient.available()) {
-    if (millis() - timeout > 60000 || !ethClient.connected()) { ethClient.stop(); return false; }
+  while (!localClient.available()) {
+    if (millis() - timeout > 60000 || !localClient.connected()) { localClient.stop(); return false; }
     delay(100);
   }
   
   String response = "";
   timeout = millis();
-  while (ethClient.available() || (ethClient.connected() && millis() - timeout < 5000)) {
-    if (ethClient.available()) { response += (char)ethClient.read(); timeout = millis(); }
+  while (localClient.available() || (localClient.connected() && millis() - timeout < 5000)) {
+    if (localClient.available()) { response += (char)localClient.read(); timeout = millis(); }
     delay(1);
   }
-  ethClient.stop();
+  localClient.stop();
   
   return (response.indexOf("200 OK") > 0 || response.indexOf("\"status\": \"success\"") > 0);
 }
