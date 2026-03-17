@@ -4,14 +4,13 @@
 #include <driver/i2s.h>
 #include <Ethernet.h>        
 #include <EthernetUdp.h>
-#include <WiFi.h>
-#include <Adafruit_NeoPixel.h>
+#include <WiFi.h>            
 #include <Update.h>
 
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-const int CURRENT_FIRMWARE_VERSION = 1; // Increase this when updating via GitHub
+const int CURRENT_FIRMWARE_VERSION = 1; 
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -31,9 +30,6 @@ const int CURRENT_FIRMWARE_VERSION = 1; // Increase this when updating via GitHu
 #define ETH_MISO        37
 #define ETH_MOSI        35
 
-#define NEOPIXEL_PIN    48
-#define NEOPIXEL_COUNT  1
-
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -51,26 +47,11 @@ const uint16_t raspberryPiPort = 5000;
 IPAddress staticIP(192, 168, 1, 152);    // Room A's IP
 IPAddress gateway(192, 168, 1, 1);       
 IPAddress subnet(255, 255, 255, 0);      
-IPAddress dns(8, 8, 8, 8);               
+IPAddress dns(192, 168, 1, 1);           // Uses router for DNS             
 
-Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 EthernetClient ethClient;
 EthernetUDP Udp;
 SPIClass sdSPI(HSPI); 
-
-// ============================================================================
-// RGB FADE BACKGROUND TASK (FreeRTOS)
-// ============================================================================
-TaskHandle_t ledTaskHandle = NULL;
-
-void ledFadeTask(void * parameter) {
-  for(;;) {
-    uint16_t hue = (millis() * 15) % 65536; 
-    pixel.setPixelColor(0, pixel.ColorHSV(hue, 255, 150)); 
-    pixel.show();
-    vTaskDelay(20 / portTICK_PERIOD_MS); 
-  }
-}
 
 // ============================================================================
 // TIMETABLE STRUCTURE 
@@ -144,7 +125,30 @@ void checkForUpdates() {
         }
         
         if (contentLength > 0 && Update.begin(contentLength)) {
-          size_t written = Update.writeStream(ethClient);
+          size_t written = 0;
+          uint8_t buffer[1024]; // 1KB chunks
+          
+          Serial.print("Progress: ");
+
+          while (ethClient.connected() && written < contentLength) {
+            size_t available = ethClient.available();
+            if (available > 0) {
+              size_t bytesToRead = min(available, sizeof(buffer));
+              int c = ethClient.read(buffer, bytesToRead);
+              Update.write(buffer, c);
+              written += c;
+
+              // Print a dot every ~50KB to show it's alive
+              if (written % (1024 * 50) < sizeof(buffer)) {
+                Serial.print(".");
+              }
+            }
+            // THIS is the magic watchdog feeder. 
+            // delay(1) forces the OS to breathe, yield() does not.
+            delay(1); 
+          }
+          Serial.println(); // Print newline after progress dots
+
           if (Update.end() && Update.isFinished()) {
             Serial.println("OTA Update successfully completed! Rebooting...");
             delay(1000);
@@ -167,7 +171,7 @@ void checkForUpdates() {
 // NTP TIME SYNC
 // ============================================================================
 unsigned long getNTPTime() {
-  const char timeServer[] = "pool.ntp.org";
+  const char timeServer[] = "216.239.35.0"; // Bypasses DNS entirely
   byte packetBuffer[48];
   memset(packetBuffer, 0, 48);
   packetBuffer[0] = 0b11100011;   
@@ -215,9 +219,6 @@ void setup() {
   delay(3000); 
   Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
   
-  pixel.begin(); 
-  xTaskCreatePinnedToCore(ledFadeTask, "LEDFade", 2048, NULL, 1, &ledTaskHandle, 0);
-
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
   pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
@@ -405,7 +406,6 @@ bool uploadFileToRaspberryPi(String filename) {
   unsigned long uploadStart = millis();
   
   while (file.available()) {
-    // --- 5 MINUTE NETWORK TIMEOUT FAILSAFE ---
     if (millis() - uploadStart > 300000) { 
       Serial.println("✗ NETWORK TIMEOUT: Upload took longer than 5 minutes.");
       ethClient.stop(); free(buffer); file.close(); return false; 
@@ -413,7 +413,7 @@ bool uploadFileToRaspberryPi(String filename) {
     
     size_t bytesRead = file.read(buffer, min((size_t)CHUNK_SIZE, (size_t)file.available()));
     ethClient.write(buffer, bytesRead);
-    yield();
+    delay(1); // Force watchdog feed during upload too!
   }
   
   ethClient.flush(); free(buffer); file.close();

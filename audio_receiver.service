@@ -1,0 +1,16 @@
+[Unit]
+Description=Audio Receiver Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/audio_receiver
+ExecStart=/usr/bin/python3 /home/pi/audio_receiver/raspberry_pi_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
