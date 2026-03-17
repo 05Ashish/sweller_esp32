@@ -2,12 +2,14 @@
 #include <SPI.h>
 #include <SD.h>
 #include <driver/i2s.h>
+#include <esp_task_wdt.h>
 #include <ETH.h>                 // --- NEW: Native ESP32 Ethernet ---
 #include <NetworkUDP.h>          // --- NEW: Native UDP ---
 #include <NetworkClient.h>       // --- NEW: Unencrypted Client (For the Pi) ---
 #include <NetworkClientSecure.h> // --- NEW: Encrypted Client (For GitHub) ---
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include <Update.h>
 #include <Adafruit_NeoPixel.h>
 
 // ============================================================================
@@ -157,6 +159,7 @@ long getCurrentSecondOfDay() {
 // ============================================================================
 void checkForUpdates() {
   Serial.printf("\nChecking GitHub for updates (Current Version: %d)...\n", CURRENT_FIRMWARE_VERSION);
+  delay(10);  // Yield before network ops
   
   // 1. Declare the Secure Network Client
   NetworkClientSecure secureClient;
@@ -164,6 +167,7 @@ void checkForUpdates() {
 
   HTTPClient http;
   http.begin(secureClient, versionURL);
+  http.setTimeout(15000);  // 15s timeout for slow connections
   int httpCode = http.GET();
 
   if (httpCode == HTTP_CODE_OK) {
@@ -173,6 +177,11 @@ void checkForUpdates() {
     if (newVersion > CURRENT_FIRMWARE_VERSION) {
       Serial.printf("New version %d found! Starting OTA Download...\n", newVersion);
       setLED(COLOR_UPDATE); // Cyan for OTA
+      
+      // Reset watchdog during OTA to prevent TG1WDT on long downloads
+      Update.onProgress([](size_t curr, size_t total) {
+        esp_task_wdt_reset();
+      });
       
       // 2. Pass the secure client into the HTTP updater
       t_httpUpdate_return ret = httpUpdate.update(secureClient, binURL);
@@ -198,16 +207,20 @@ void setup() {
   Serial.begin(115200);
   delay(3000); 
   Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
+  delay(10);  // Yield to prevent task watchdog during init
   
   pixel.begin(); setLED(COLOR_BOOT);
+  delay(10);
 
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
 
   // Initialize Native ETH.h for W5500
   SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
+  delay(10);
   if (!ETH.begin(ETH_PHY_W5500, 1, ETH_CS, -1, -1, SPI)) {
     Serial.println("ETH.begin failed");
   }
+  delay(50);  // Let Ethernet driver tasks stabilize (prevents TG1WDT)
   
   ETH.config(staticIP, gateway, subnet, dns);
   delay(5000); // Give the switch time to wake the port
@@ -226,6 +239,7 @@ void setup() {
       Serial.println("NTP Sync failed. Retrying...");
       delay(2000);
     }
+    delay(10);  // Yield to prevent task watchdog during retry loop
   }
   bootMillis = millis();
   
@@ -234,6 +248,7 @@ void setup() {
 
   // --- CHECK GITHUB FOR UPDATES EVERY BOOT ---
   checkForUpdates();
+  delay(10);
 
   // Initialize SD Card
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -258,6 +273,7 @@ void setup() {
   i2s_pin_config_t pin_config = { .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = -1, .data_in_num = I2S_SD };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
+  delay(10);
   
   Serial.println("System Ready. Waiting for next class...");
   setLED(COLOR_IDLE);
