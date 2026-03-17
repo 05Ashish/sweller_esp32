@@ -6,11 +6,19 @@
 #include <EthernetUdp.h>
 #include <WiFi.h>            
 #include <Update.h>
+#include <Adafruit_NeoPixel.h>  // Add this back
+
+// ... keep your existing pin defines ...
+
+#define NEOPIXEL_PIN    48      // The built-in LED on ESP32-S3
+#define NEOPIXEL_COUNT  1
+
+Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-const int CURRENT_FIRMWARE_VERSION = 2; 
+const int CURRENT_FIRMWARE_VERSION = 3; 
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -171,6 +179,8 @@ void checkForUpdates() {
 // NTP TIME SYNC
 // ============================================================================
 unsigned long getNTPTime() {
+  pixel.setPixelColor(0, pixel.Color(20, 20, 20)); // Dim White
+  pixel.show();
   const char timeServer[] = "216.239.35.0"; // Bypasses DNS entirely
   byte packetBuffer[48];
   memset(packetBuffer, 0, 48);
@@ -195,7 +205,7 @@ unsigned long getNTPTime() {
       Udp.stop();
       return epoch + TIME_ZONE_OFFSET; 
     }
-    delay(10);
+    delay(100);
   }
   Udp.stop();
   return 0; 
@@ -215,6 +225,9 @@ long getCurrentSecondOfDay() {
 // SETUP
 // ============================================================================
 void setup() {
+  pixel.begin();
+  pixel.setPixelColor(0, pixel.Color(50, 20, 0)); // Dim Orange (Warm startup)
+  pixel.show();
   Serial.begin(115200);
   delay(3000); 
   Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
@@ -250,6 +263,8 @@ void setup() {
   // --- CHECK THE PI FOR UPDATES EVERY BOOT ---
   checkForUpdates();
 
+  delay(2000);
+
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSPI, 10000000)) {
     Serial.println("SD PERMANENT FAILURE");
@@ -272,6 +287,8 @@ void setup() {
   i2s_set_pin(I2S_PORT, &pin_config);
   
   Serial.println("System Ready. Waiting for next class...");
+  pixel.setPixelColor(0, pixel.Color(0, 50, 0)); // Solid Green (System is safe)
+  pixel.show();
 }
 
 // ============================================================================
