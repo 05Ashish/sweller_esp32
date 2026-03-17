@@ -18,7 +18,7 @@ Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-const int CURRENT_FIRMWARE_VERSION = 3; 
+const int CURRENT_FIRMWARE_VERSION = 4; 
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -28,7 +28,7 @@ const int CURRENT_FIRMWARE_VERSION = 3;
 #define I2S_SD          6
 #define I2S_PORT        I2S_NUM_0
 
-#define SD_CS           10
+#define SD_CS           10 
 #define SD_SCK          12
 #define SD_MISO         13
 #define SD_MOSI         11
@@ -98,24 +98,36 @@ struct WavHeader {
 void checkForUpdates() {
   Serial.printf("\nChecking Local Pi for updates (Current Version: %d)...\n", CURRENT_FIRMWARE_VERSION);
   
+  // Prevent readStringUntil from hanging the processor if the network drops
+  ethClient.setTimeout(2000); 
+  
   if (ethClient.connect(raspberryPi, raspberryPiPort)) {
     ethClient.println("GET /firmware/version.txt HTTP/1.1");
     ethClient.printf("Host: %s\r\n", raspberryPi.toString().c_str());
     ethClient.println("Connection: close\r\n");
     
+    unsigned long startTime = millis();
+    while (ethClient.connected() && !ethClient.available()) {
+      delay(1); // <-- FEED THE WATCHDOG
+      if (millis() - startTime > 3000) { 
+        ethClient.stop(); 
+        Serial.println("Pi timed out.");
+        return; 
+      }
+    }
+    
     // Skip HTTP Headers
     while (ethClient.connected()) {
       String line = ethClient.readStringUntil('\n');
       if (line == "\r") break; 
+      delay(1); // <-- FEED THE WATCHDOG
     }
     
-    String versionStr = ethClient.readStringUntil('\n');
-    versionStr.trim();
-    int availableVersion = versionStr.toInt();
+    int availableVersion = ethClient.readStringUntil('\n').toInt();
     ethClient.stop();
     
     if (availableVersion > CURRENT_FIRMWARE_VERSION) {
-      Serial.printf("New version %d found on Pi! Downloading...\n", availableVersion);
+      Serial.printf("New version %d found! Downloading...\n", availableVersion);
       
       if (ethClient.connect(raspberryPi, raspberryPiPort)) {
         ethClient.println("GET /firmware/firmware.bin HTTP/1.1");
@@ -129,40 +141,31 @@ void checkForUpdates() {
           if (line.startsWith("Content-Length: ")) {
             contentLength = line.substring(16).toInt();
           }
-          if (line.length() == 0) break; // End of headers
+          if (line.length() == 0) break; 
+          delay(1);
         }
         
         if (contentLength > 0 && Update.begin(contentLength)) {
           size_t written = 0;
-          uint8_t buffer[1024]; // 1KB chunks
-          
+          uint8_t buffer[1024]; 
           Serial.print("Progress: ");
-
+          
           while (ethClient.connected() && written < contentLength) {
             size_t available = ethClient.available();
             if (available > 0) {
-              size_t bytesToRead = min(available, sizeof(buffer));
-              int c = ethClient.read(buffer, bytesToRead);
+              int c = ethClient.read(buffer, min(available, sizeof(buffer)));
               Update.write(buffer, c);
               written += c;
-
-              // Print a dot every ~50KB to show it's alive
-              if (written % (1024 * 50) < sizeof(buffer)) {
-                Serial.print(".");
-              }
+              if (written % (1024 * 50) < sizeof(buffer)) Serial.print(".");
             }
-            // THIS is the magic watchdog feeder. 
-            // delay(1) forces the OS to breathe, yield() does not.
-            delay(1); 
+            delay(1); // <-- THE MOST IMPORTANT DELAY
           }
-          Serial.println(); // Print newline after progress dots
+          Serial.println();
 
           if (Update.end() && Update.isFinished()) {
-            Serial.println("OTA Update successfully completed! Rebooting...");
+            Serial.println("OTA Update Complete! Rebooting...");
             delay(1000);
             ESP.restart(); 
-          } else {
-            Serial.printf("OTA Write Error #: %d\n", Update.getError());
           }
         }
         ethClient.stop();
@@ -171,7 +174,7 @@ void checkForUpdates() {
       Serial.println("Firmware is up to date.");
     }
   } else {
-    Serial.println("Failed to connect to Pi for update check.");
+    Serial.println("Failed to connect to Pi.");
   }
 }
 
@@ -225,53 +228,80 @@ long getCurrentSecondOfDay() {
 // SETUP
 // ============================================================================
 void setup() {
-  pixel.begin();
-  pixel.setPixelColor(0, pixel.Color(50, 20, 0)); // Dim Orange (Warm startup)
-  pixel.show();
   Serial.begin(115200);
-  delay(3000); 
+  
+  // 1. Give the Serial monitor just a tiny fraction of a second, not 3 whole seconds!
+  delay(500); 
   Serial.println("\n--- SMART TIMETABLE SYSTEM STARTING ---");
   
+  // 2. Initialize the State Light (Orange = Booting)
+  pixel.begin();
+  pixel.setPixelColor(0, pixel.Color(50, 20, 255)); 
+  pixel.show();
+
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
   pinMode(ETH_CS, OUTPUT); digitalWrite(ETH_CS, HIGH);
 
   WiFi.mode(WIFI_STA); delay(100);
   WiFi.macAddress(mac);
-  SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
+  
+  SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, -1);
   Ethernet.init(ETH_CS);
   
-  Serial.println("Forcing Static IP (Bypassing DHCP)...");
+  Serial.print("Initializing Ethernet");
   Ethernet.begin(mac, staticIP, dns, gateway, subnet);
-  delay(5000); 
   
-  Serial.print("Ethernet OK. Forced IP: "); 
-  Serial.println(Ethernet.localIP());
+  // --- SMART WAIT: No more 5-second blind delays! ---
+  // We wait up to 4 seconds, but move on IMMEDIATELY once the cable is detected.
+  unsigned long linkStart = millis();
+  while(Ethernet.linkStatus() != LinkON && millis() - linkStart < 4000) {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  if (Ethernet.linkStatus() == LinkON) {
+    Serial.print("Ethernet Link UP. IP: "); 
+    Serial.println(Ethernet.localIP());
+  } else {
+    Serial.println("Warning: No Ethernet Link Detected.");
+  }
 
-  Serial.println("Syncing Time with NTP...");
-  while (baseEpochTime == 0) {
+  // 3. Sync Time (White = Syncing)
+  pixel.setPixelColor(0, pixel.Color(20, 20, 20));
+  pixel.show();
+  
+  // Prevent the NTP from getting stuck forever and tripping the watchdog
+  int ntpRetries = 0;
+  while (baseEpochTime == 0 && ntpRetries < 3) {
     baseEpochTime = getNTPTime();
     if (baseEpochTime == 0) {
-      Serial.println("NTP Sync failed. Retrying...");
-      delay(2000);
+      delay(1000); 
+      ntpRetries++;
     }
   }
   bootMillis = millis();
-  
-  int currentMin = getCurrentMinuteOfDay();
-  Serial.printf("Time Synced! Current Local Time: %02d:%02d\n", currentMin / 60, currentMin % 60);
 
-  // --- CHECK THE PI FOR UPDATES EVERY BOOT ---
+// 4. Check the Pi for OTA Updates
   checkForUpdates();
+  
+  delay(1000); // 1-second breather
 
-  delay(2000);
-
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  // --- TRACER ROUND 1: SD CARD ---
+  Serial.println("\n[TRACER] -> Initializing SD Card...");
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
   if (!SD.begin(SD_CS, sdSPI, 10000000)) {
-    Serial.println("SD PERMANENT FAILURE");
-    while(1) delay(1000);
+     Serial.println("[ERROR] -> SD FAILURE");
+     pixel.setPixelColor(0, pixel.Color(100, 0, 0)); // Red = Fatal Error
+     pixel.show();
+     while(1) { delay(1000); } 
   }
-  if (!SD.exists("/recordings")) SD.mkdir("/recordings");
+  Serial.println("[TRACER] -> SD Card OK.");
 
+  delay(500);
+
+  // --- TRACER ROUND 2: MICROPHONE (I2S) ---
+  Serial.println("[TRACER] -> Initializing I2S Microphone...");
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
@@ -285,9 +315,11 @@ void setup() {
   i2s_pin_config_t pin_config = { .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS, .data_out_num = -1, .data_in_num = I2S_SD };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
-  
-  Serial.println("System Ready. Waiting for next class...");
-  pixel.setPixelColor(0, pixel.Color(0, 50, 0)); // Solid Green (System is safe)
+  Serial.println("[TRACER] -> I2S Microphone OK.");
+
+  // 6. System Ready! 
+  Serial.println("\n--- SYSTEM FULLY READY ---");
+  pixel.setPixelColor(0, pixel.Color(0, 50, 0)); 
   pixel.show();
 }
 
